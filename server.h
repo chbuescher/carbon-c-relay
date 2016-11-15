@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@
 
 #include "relay.h"
 
+#define SERVER_STALL_BITS  4  /* 0 up to 15 */
+
 typedef struct _server server;
 
 server *server_new(
@@ -31,13 +33,17 @@ server *server_new(
 		struct addrinfo *saddr,
 		size_t queuesize,
 		size_t batchsize,
-		unsigned short iotimeout);
+		int maxstalls,
+		unsigned short iotimeout,
+		unsigned int sockbufsize);
+char server_start(server *s);
 void server_add_secondaries(server *d, server **sec, size_t cnt);
 void server_set_failover(server *d);
 void server_set_instance(server *d, char *inst);
 char server_send(server *s, const char *d, char force);
-void server_stop(server *s);
 void server_shutdown(server *s);
+void server_free(server *s);
+void server_swap_queue(server *l, server *r);
 const char *server_ip(server *s);
 unsigned short server_port(server *s);
 char *server_instance(server *s);

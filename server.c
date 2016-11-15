@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,14 +20,17 @@
 #include <string.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <poll.h>
 #include <errno.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/resource.h>
+#include <assert.h>
 
 #include "relay.h"
 #include "queue.h"
@@ -44,15 +47,18 @@ struct _server {
 	queue *queue;
 	size_t bsize;
 	short iotimeout;
+	unsigned int sockbufsize;
+	unsigned char maxstalls:SERVER_STALL_BITS;
 	const char **batch;
 	serv_ctype ctype;
 	pthread_t tid;
 	struct _server **secondaries;
 	size_t secondariescnt;
 	char failover:1;
-	char failure:5;
+	char failure;       /* full byte for atomic access */
 	char running:1;
-	char keep_running:1;
+	char keep_running;  /* full byte for atomic access */
+	unsigned char stallseq:SERVER_STALL_BITS;
 	size_t metrics;
 	size_t dropped;
 	size_t stalls;
@@ -70,7 +76,7 @@ struct _server {
  * batched, but sent one by one to reduce loss on sending failure.
  * A connection with the server is maintained for as long as there is
  * data to be written.  As soon as there is none, the connection is
- * dropped.
+ * dropped if a timeout of DISCONNECT_WAIT_TIME exceeds.
  */
 static void *
 server_queuereader(void *d)
@@ -81,14 +87,15 @@ server_queuereader(void *d)
 	const char **metric = self->batch;
 	struct timeval start, stop;
 	struct timeval timeout;
-	int timeoutms;
-	queue *queue;
+	queue *squeue;
 	char idle = 0;
 	size_t *secpos = NULL;
+	unsigned char cnt;
+	const char *p;
 
 	*metric = NULL;
-	self->metrics = 0;
-	self->ticks = 0;
+	__sync_and_and_fetch(&(self->metrics), 0);
+	__sync_and_and_fetch(&(self->ticks), 0);
 
 #define FAIL_WAIT_TIME   6  /* 6 * 250ms = 1.5s */
 #define DISCONNECT_WAIT_TIME   12  /* 12 * 250ms = 3s */
@@ -99,33 +106,40 @@ server_queuereader(void *d)
 			/* if we're idling, close the TCP connection, this allows us
 			 * to reduce connections, while keeping the connection alive
 			 * if we're writing a lot */
+			gettimeofday(&start, NULL);
 			if (self->ctype == CON_TCP && self->fd >= 0 &&
 					idle++ > DISCONNECT_WAIT_TIME)
 			{
 				close(self->fd);
 				self->fd = -1;
 			}
-			if (!self->keep_running)
+			gettimeofday(&stop, NULL);
+			__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
+			if (__sync_bool_compare_and_swap(&(self->keep_running), 0, 0))
 				break;
 			/* nothing to do, so slow down for a bit */
 			usleep((200 + (rand() % 100)) * 1000);  /* 200ms - 300ms */
 			/* if we are in failure mode, keep checking if we can
 			 * connect, this avoids unnecessary queue moves */
-			if (!self->failure)
+			if (__sync_bool_compare_and_swap(&(self->failure), 0, 0))
 				/* it makes no sense to try and do something, so skip */
 				continue;
 		} else if (self->secondariescnt > 0 &&
-				(self->failure >= FAIL_WAIT_TIME ||
+				(__sync_add_and_fetch(&(self->failure), 0) >= FAIL_WAIT_TIME ||
 				 (!self->failover && LEN_CRITICAL(self->queue))))
 		{
 			size_t i;
 
+			gettimeofday(&start, NULL);
 			if (self->secondariescnt > 0) {
 				if (secpos == NULL) {
 					secpos = malloc(sizeof(size_t) * self->secondariescnt);
 					if (secpos == NULL) {
 						logerr("server: failed to allocate memory "
 								"for secpos\n");
+						gettimeofday(&stop, NULL);
+						__sync_add_and_fetch(&(self->ticks),
+								timediff(start, stop));
 						continue;
 					}
 					for (i = 0; i < self->secondariescnt; i++)
@@ -157,14 +171,15 @@ server_queuereader(void *d)
 			 * - do nothing (we will overflow, since we can't send
 			 *   anywhere) */
 			*metric = NULL;
-			queue = NULL;
+			squeue = NULL;
 			for (i = 0; i < self->secondariescnt; i++) {
 				/* both conditions below make sure we skip ourself */
-				if (self->secondaries[secpos[i]]->failure)
+				if (__sync_add_and_fetch(
+							&(self->secondaries[secpos[i]]->failure), 0))
 					continue;
-				queue = self->secondaries[secpos[i]]->queue;
-				if (!self->failover && LEN_CRITICAL(queue)) {
-					queue = NULL;
+				squeue = self->secondaries[secpos[i]]->queue;
+				if (!self->failover && LEN_CRITICAL(squeue)) {
+					squeue = NULL;
 					continue;
 				}
 				if (*metric == NULL) {
@@ -176,7 +191,7 @@ server_queuereader(void *d)
 				}
 
 				for (; *metric != NULL; metric++)
-					if (!queue_putback(queue, *metric))
+					if (!queue_putback(squeue, *metric))
 						break;
 				/* try to put back stuff that didn't fit */
 				for (; *metric != NULL; metric++)
@@ -184,21 +199,29 @@ server_queuereader(void *d)
 						break;
 			}
 			for (; *metric != NULL; metric++) {
-				if (mode == DEBUG)
+				if (mode & MODE_DEBUG)
 					logerr("dropping metric: %s", *metric);
 				free((char *)*metric);
-				self->dropped++;
+				__sync_add_and_fetch(&(self->dropped), 1);
 			}
-			if (queue == NULL) {
+			gettimeofday(&stop, NULL);
+			self->ticks += timediff(start, stop);
+			if (squeue == NULL) {
 				/* we couldn't do anything, take it easy for a bit */
-				if (self->failure)
-					self->failure = 1;
-				if (!self->keep_running)
+				if (__sync_add_and_fetch(&(self->failure), 0) > 1) {
+					/* This is a compound because I can't seem to figure
+					 * out how to atomically just "set" a variable.
+					 * It's not bad when in the middle there is a ++,
+					 * all that counts is that afterwards its > 0. */
+					__sync_and_and_fetch(&(self->failure), 0);
+					__sync_add_and_fetch(&(self->failure), 1);
+				}
+				if (__sync_bool_compare_and_swap(&(self->keep_running), 0, 0))
 					break;
 				usleep((200 + (rand() % 100)) * 1000);  /* 200ms - 300ms */
 			}
-		} else if (self->failure) {
-			if (!self->keep_running)
+		} else if (__sync_add_and_fetch(&(self->failure), 0) > 0) {
+			if (__sync_bool_compare_and_swap(&(self->keep_running), 0, 0))
 				break;
 			usleep((200 + (rand() % 100)) * 1000);  /* 200ms - 300ms */
 		}
@@ -214,9 +237,8 @@ server_queuereader(void *d)
 			if (self->ctype == CON_PIPE) {
 				int intconn[2];
 				if (pipe(intconn) < 0) {
-					if (!self->failure)
+					if (__sync_fetch_and_add(&(self->failure), 1) == 0)
 						logerr("failed to create pipe: %s\n", strerror(errno));
-					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 					continue;
 				}
 				dispatch_addconnection(intconn[0]);
@@ -226,21 +248,19 @@ server_queuereader(void *d)
 								self->saddr->ai_socktype,
 								self->saddr->ai_protocol)) < 0)
 				{
-					if (!self->failure)
+					if (__sync_fetch_and_add(&(self->failure), 1) == 0)
 						logerr("failed to create udp socket: %s\n",
 								strerror(errno));
-					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 					continue;
 				}
 				if (connect(self->fd,
 						self->saddr->ai_addr, self->saddr->ai_addrlen) < 0)
 				{
-					if (!self->failure)
+					if (__sync_fetch_and_add(&(self->failure), 1) == 0)
 						logerr("failed to connect udp socket: %s\n",
 								strerror(errno));
 					close(self->fd);
 					self->fd = -1;
-					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 					continue;
 				}
 			} else if (self->ctype == CON_FILE) {
@@ -248,10 +268,9 @@ server_queuereader(void *d)
 								O_WRONLY | O_APPEND | O_CREAT,
 								S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) < 0)
 				{
-					if (!self->failure)
+					if (__sync_fetch_and_add(&(self->failure), 1) == 0)
 						logerr("failed to open file '%s': %s\n",
 								self->ip, strerror(errno));
-					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 					continue;
 				}
 			} else {
@@ -262,100 +281,102 @@ server_queuereader(void *d)
 								self->saddr->ai_socktype,
 								self->saddr->ai_protocol)) < 0)
 				{
-					if (!self->failure)
+					if (__sync_fetch_and_add(&(self->failure), 1) == 0)
 						logerr("failed to create socket: %s\n",
 								strerror(errno));
-					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 					continue;
 				}
 
 				/* put socket in non-blocking mode such that we can
-				 * select() (time-out) on the connect() call */
+				 * poll() (time-out) on the connect() call */
 				args = fcntl(self->fd, F_GETFL, NULL);
-				(void) fcntl(self->fd, F_SETFL, args | O_NONBLOCK);
+				if (fcntl(self->fd, F_SETFL, args | O_NONBLOCK) < 0) {
+					logerr("failed to set socket non-blocking mode: %s\n",
+							strerror(errno));
+					close(self->fd);
+					self->fd = -1;
+					continue;
+				}
 				ret = connect(self->fd,
 						self->saddr->ai_addr, self->saddr->ai_addrlen);
 
 				if (ret < 0 && errno == EINPROGRESS) {
 					/* wait for connection to succeed if the OS thinks
 					 * it can succeed */
-					fd_set fds;
-					FD_ZERO(&fds);
-					FD_SET(self->fd, &fds);
-					timeoutms = self->iotimeout + (rand() % 100);
-					timeout.tv_sec = timeoutms / 1000;
-					timeout.tv_usec = (timeoutms % 1000) * 1000;
-					ret = select(self->fd + 1, NULL, &fds, NULL, &timeout);
+					struct pollfd ufds[1];
+					ufds[0].fd = self->fd;
+					ufds[0].events = POLLIN | POLLOUT;
+					ret = poll(ufds, 1, self->iotimeout + (rand() % 100));
 					if (ret == 0) {
 						/* time limit expired */
-						if (!self->failure)
+						if (__sync_fetch_and_add(&(self->failure), 1) == 0)
 							logerr("failed to connect() to "
 									"%s:%u: Operation timed out\n",
 									self->ip, self->port);
 						close(self->fd);
 						self->fd = -1;
-						self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 						continue;
 					} else if (ret < 0) {
 						/* some select error occurred */
-						if (!self->failure)
-							logerr("failed to select() for %s:%u: %s\n",
+						if (__sync_fetch_and_add(&(self->failure), 1) == 0)
+							logerr("failed to poll() for %s:%u: %s\n",
 									self->ip, self->port, strerror(errno));
 						close(self->fd);
 						self->fd = -1;
-						self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 						continue;
 					} else {
-						int serr = 0;
-						socklen_t serrlen = sizeof(serr);
-						if (getsockopt(self->fd, SOL_SOCKET, SO_ERROR,
-									(void *)(&serr), &serrlen) < 0)
-						{
-							if (!self->failure)
-								logerr("failed to getsockopt() for %s:%u: %s\n",
-										self->ip, self->port, strerror(errno));
+						if (ufds[0].revents & POLLHUP) {
+							if (__sync_fetch_and_add(&(self->failure), 1) == 0)
+								logerr("failed to connect() for %s:%u: "
+										"Hangup\n", self->ip, self->port);
 							close(self->fd);
 							self->fd = -1;
-							self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
-							continue;
-						}
-						if (serr != 0) {
-							if (!self->failure) {
-								logerr("failed to connect() to %s:%u: %s "
-										"(after select())\n",
-										self->ip, self->port, strerror(serr));
-								dispatch_check_rlimit_and_warn();
-							}
-							close(self->fd);
-							self->fd = -1;
-							self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 							continue;
 						}
 					}
 				} else if (ret < 0) {
-					if (!self->failure) {
+					if (__sync_fetch_and_add(&(self->failure), 1) == 0) {
 						logerr("failed to connect() to %s:%u: %s\n",
 								self->ip, self->port, strerror(errno));
 						dispatch_check_rlimit_and_warn();
 					}
 					close(self->fd);
 					self->fd = -1;
-					self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 					continue;
 				}
 
 				/* make socket blocking again */
-				(void) fcntl(self->fd, F_SETFL, args);
+				if (fcntl(self->fd, F_SETFL, args) < 0) {
+					logerr("failed to remove socket non-blocking mode: %s\n",
+							strerror(errno));
+					close(self->fd);
+					self->fd = -1;
+					continue;
+				}
+
+				/* disable Nagle's algorithm, issue #208 */
+				args = 1;
+				if (setsockopt(self->fd, IPPROTO_TCP, TCP_NODELAY,
+							&args, sizeof(args)) != 0)
+					; /* ignore */
 			}
 
-			/* ensure we will break out of connections being stuck */
-			timeoutms = self->iotimeout + (rand() % 100);
-			timeout.tv_sec = timeoutms / 1000;
-			timeout.tv_usec = (timeoutms % 1000) * 1000;
-			setsockopt(self->fd, SOL_SOCKET, SO_SNDTIMEO,
-					&timeout, sizeof(timeout));
+			/* ensure we will break out of connections being stuck more
+			 * quickly than the kernel would give up */
+			timeout.tv_sec = 10;
+			timeout.tv_usec = (rand() % 300) * 1000;
+			if (setsockopt(self->fd, SOL_SOCKET, SO_SNDTIMEO,
+					&timeout, sizeof(timeout)) != 0)
+				; /* ignore */
+			if (self->sockbufsize > 0)
+				if (setsockopt(self->fd, SOL_SOCKET, SO_SNDBUF,
+						&self->sockbufsize, sizeof(self->sockbufsize)) != 0)
+					; /* ignore */
 #ifdef SO_NOSIGPIPE
-			setsockopt(self->fd, SOL_SOCKET, SO_NOSIGPIPE, NULL, 0);
+			if (self->ctype == CON_TCP || self->ctype == CON_UDP)
+				if (setsockopt(self->fd, SOL_SOCKET, SO_NOSIGPIPE, NULL, 0) != 0)
+					logout("warning: failed to ignore SIGPIPE on socket: %s\n",
+							strerror(errno));
 #endif
 		}
 
@@ -364,14 +385,16 @@ server_queuereader(void *d)
 		self->batch[len] = NULL;
 		metric = self->batch;
 
-		if (len != 0 && !self->keep_running) {
+		if (len != 0 &&
+				__sync_bool_compare_and_swap(&(self->keep_running), 0, 0))
+		{
 			/* be noisy during shutdown so we can track any slowing down
 			 * servers, possibly preventing us to shut down */
-			logerr("shutting down %s:%u: waiting for %zd metrics\n",
+			logerr("shutting down %s:%u: waiting for %zu metrics\n",
 					self->ip, self->port, len + queue_len(self->queue));
 		}
 
-		if (len == 0 && self->failure) {
+		if (len == 0 && __sync_add_and_fetch(&(self->failure), 0)) {
 			/* if we don't have anything to send, we have at least a
 			 * connection succeed, so assume the server is up again,
 			 * this is in particular important for recovering this
@@ -379,46 +402,58 @@ server_queuereader(void *d)
 			 * its queue is possibly being offloaded to secondaries */
 			if (self->ctype != CON_UDP)
 				logerr("server %s:%u: OK after probe\n", self->ip, self->port);
-			self->failure = 0;
+			__sync_and_and_fetch(&(self->failure), 0);
 		}
 
 		for (; *metric != NULL; metric++) {
 			len = strlen(*metric);
-			if ((slen = write(self->fd, *metric, len)) != len) {
-				/* not fully sent, or failure, close connection
-				 * regardless so we don't get synchonisation problems,
-				 * partially sent data is an error for us, since we use
-				 * blocking sockets, and hence partial sent is
-				 * indication of a failure */
-				if (self->ctype != CON_UDP)
+			/* Write to the stream, this may not succeed completely due
+			 * to flow control and whatnot, which the docs suggest need
+			 * resuming to complete.  So, use a loop, but to avoid
+			 * getting endlessly stuck on this, only try a limited
+			 * number of times for a single metric. */
+			for (cnt = 0, p = *metric;
+					cnt < 10 &&
+						(slen = write(self->fd, p, len)) != len &&
+						slen >= 0;
+					cnt++)
+			{
+				p += slen;
+				len -= slen;
+			}
+			if (slen != len) {
+				/* not fully sent (after tries), or failure
+				 * close connection regardless so we don't get
+				 * synchonisation problems */
+				if (self->ctype != CON_UDP &&
+						__sync_fetch_and_add(&(self->failure), 1) == 0)
 					logerr("failed to write() to %s:%u: %s\n",
 							self->ip, self->port,
 							(slen < 0 ? strerror(errno) : "uncomplete write"));
 				close(self->fd);
 				self->fd = -1;
-				self->failure += self->failure >= FAIL_WAIT_TIME ? 0 : 1;
 				/* put back stuff we couldn't process */
 				for (; *metric != NULL; metric++) {
 					if (!queue_putback(self->queue, *metric)) {
-						if (mode == DEBUG)
+						if (mode & MODE_DEBUG)
 							logerr("server %s:%u: dropping metric: %s",
 									self->ip, self->port, *metric);
 						free((char *)*metric);
-						self->dropped++;
+						__sync_add_and_fetch(&(self->dropped), 1);
 					}
 				}
 				break;
-			} else if (self->failure) {
+			} else if (!__sync_bool_compare_and_swap(&(self->failure), 0, 0)) {
 				if (self->ctype != CON_UDP)
 					logerr("server %s:%u: OK\n", self->ip, self->port);
-				self->failure = 0;
+				__sync_and_and_fetch(&(self->failure), 0);
 			}
 			free((char *)*metric);
-			self->metrics++;
+			__sync_add_and_fetch(&(self->metrics), 1);
 		}
 
 		gettimeofday(&stop, NULL);
-		self->ticks += timediff(start, stop);
+		__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
 
 		idle = 0;
 	}
@@ -426,6 +461,8 @@ server_queuereader(void *d)
 
 	if (self->fd >= 0)
 		close(self->fd);
+	if (secpos != NULL)
+		free(secpos);
 	return NULL;
 }
 
@@ -442,7 +479,9 @@ server_new(
 		struct addrinfo *saddr,
 		size_t qsize,
 		size_t bsize,
-		unsigned short iotimeout)
+		int maxstalls,
+		unsigned short iotimeout,
+		unsigned int sockbufsize)
 {
 	server *ret;
 
@@ -454,11 +493,18 @@ server_new(
 	ret->secondaries = NULL;
 	ret->secondariescnt = 0;
 	ret->ip = strdup(ip);
+	if (ret->ip == NULL) {
+		free(ret);
+		return NULL;
+	}
 	ret->port = port;
 	ret->instance = NULL;
 	ret->bsize = bsize;
 	ret->iotimeout = iotimeout < 250 ? 600 : iotimeout;
+	ret->sockbufsize = sockbufsize;
+	ret->maxstalls = maxstalls;
 	if ((ret->batch = malloc(sizeof(char *) * (bsize + 1))) == NULL) {
+		free((char *)ret->ip);
 		free(ret);
 		return NULL;
 	}
@@ -466,14 +512,17 @@ server_new(
 	ret->saddr = saddr;
 	ret->queue = queue_new(qsize);
 	if (ret->queue == NULL) {
+		free(ret->batch);
 		free((char *)ret->ip);
 		free(ret);
 		return NULL;
 	}
 
+	ret->failover = 0;
 	ret->failure = 0;
 	ret->running = 0;
 	ret->keep_running = 1;
+	ret->stallseq = 0;
 	ret->metrics = 0;
 	ret->dropped = 0;
 	ret->stalls = 0;
@@ -482,21 +531,26 @@ server_new(
 	ret->prevdropped = 0;
 	ret->prevstalls = 0;
 	ret->prevticks = 0;
-
-	if (pthread_create(&ret->tid, NULL, &server_queuereader, ret) != 0) {
-		free((char *)ret->ip);
-		free(ret);
-		return NULL;
-	}
+	ret->tid = 0;
 
 	return ret;
 }
 
 /**
+ * Starts a previously created server using server_new().  Returns
+ * errno if starting a thread failed, after which the caller should
+ * server_free() the given s pointer.
+ */
+char
+server_start(server *s)
+{
+	return pthread_create(&s->tid, NULL, &server_queuereader, s);
+}
+
+/**
  * Adds a list of secondary servers to this server.  A secondary server
  * is a server which' queue will be checked when this server has nothing
- * to do.  This is different from a backup server in that all servers
- * involved have their own queue which they are supposed to deal with.
+ * to do.
  */
 void
 server_add_secondaries(server *self, server **secondaries, size_t count)
@@ -521,6 +575,8 @@ server_set_failover(server *self)
 void
 server_set_instance(server *self, char *instance)
 {
+	if (self->instance != NULL)
+		free(self->instance);
 	self->instance = strdup(instance);
 }
 
@@ -534,25 +590,28 @@ inline char
 server_send(server *s, const char *d, char force)
 {
 	if (queue_free(s->queue) == 0) {
-		char failure = s->failure;
+		char failure = __sync_add_and_fetch(&(s->failure), 0);
 		if (!force && s->secondariescnt > 0) {
 			size_t i;
 			/* don't immediately drop if we know there are others that
 			 * back us up */
 			for (i = 0; i < s->secondariescnt; i++) {
-				if (!s->secondaries[i]->failure) {
+				if (!__sync_add_and_fetch(&(s->secondaries[i]->failure), 0)) {
 					failure = 0;
 					break;
 				}
 			}
 		}
-		if (failure || force) {
-			s->dropped++;
+		if (failure || force || s->stallseq == s->maxstalls) {
+			__sync_add_and_fetch(&(s->dropped), 1);
 			/* excess event will be dropped by the enqueue below */
 		} else {
-			s->stalls++;
+			s->stallseq++;
+			__sync_add_and_fetch(&(s->stalls), 1);
 			return 0;
 		}
+	} else {
+		s->stallseq = 0;
 	}
 	queue_enqueue(s->queue, d);
 
@@ -560,32 +619,18 @@ server_send(server *s, const char *d, char force)
 }
 
 /**
- * Signals this server to stop whatever it's doing.
- */
-void
-server_stop(server *s)
-{
-	if (s->secondariescnt == 0)
-		s->keep_running = 0;
-}
-
-/**
- * Waits for this server to finish sending pending items from its queue.
+ * Tells this server to finish sending pending items from its queue.
  */
 void
 server_shutdown(server *s)
 {
 	int i;
-	pthread_t tid;
 	size_t failures;
 	size_t inqueue;
-	int err;
 
-	if (s->tid == 0)
+	/* this function should only be called on a running server */
+	if (__sync_bool_compare_and_swap(&(s->keep_running), 0, 0))
 		return;
-
-	tid = s->tid;
-	s->tid = 0;
 
 	if (s->secondariescnt > 0) {
 		/* if we have a working connection, or we still have stuff in
@@ -595,7 +640,7 @@ server_shutdown(server *s)
 			failures = 0;
 			inqueue = 0;
 			for (i = 0; i < s->secondariescnt; i++) {
-				if (s->secondaries[i]->failure)
+				if (__sync_add_and_fetch(&(s->secondaries[i]->failure), 0))
 					failures++;
 				if (s->secondaries[i]->running)
 					inqueue += queue_len(s->secondaries[i]->queue);
@@ -603,30 +648,43 @@ server_shutdown(server *s)
 			/* loop until we all failed, or nothing is in the queues */
 		} while (failures != s->secondariescnt &&
 				inqueue != 0 &&
-				logerr("any_of cluster pending %zd metrics "
-					"(with %zd failed nodes)\n", inqueue, failures) >= -1 &&
+				logout("any_of cluster pending %zu metrics "
+					"(with %zu failed nodes)\n", inqueue, failures) >= -1 &&
 				usleep((200 + (rand() % 100)) * 1000) <= 0);
 		/* shut down entire cluster */
 		for (i = 0; i < s->secondariescnt; i++)
-			s->secondaries[i]->keep_running = 0;
+			__sync_bool_compare_and_swap(
+					&(s->secondaries[i]->keep_running), 1, 0);
 		/* to pretend to be dead for above loop (just in case) */
 		if (inqueue != 0)
 			for (i = 0; i < s->secondariescnt; i++)
-				s->secondaries[i]->failure = 1;
+				__sync_add_and_fetch(&(s->secondaries[i]->failure), 1);
 	}
 
-	s->keep_running = 0;
-	if ((err = pthread_join(tid, NULL)) != 0)
+	__sync_bool_compare_and_swap(&(s->keep_running), 1, 0);
+}
+
+/**
+ * Frees this server and associated resources.  This includes joining
+ * the server thread.
+ */
+void
+server_free(server *s) {
+	int err;
+
+	if (s->tid != 0 && (err = pthread_join(s->tid, NULL)) != 0)
 		logerr("%s:%u: failed to join server thread: %s\n",
 				s->ip, s->port, strerror(err));
+	s->tid = 0;
 
 	if (s->ctype == CON_TCP) {
 		size_t qlen = queue_len(s->queue);
-		queue_destroy(s->queue);
 		if (qlen > 0)
-			logerr("dropping %zd metrics for %s:%u\n",
+			logerr("dropping %zu metrics for %s:%u\n",
 					qlen, s->ip, s->port);
 	}
+
+	queue_destroy(s->queue);
 	free(s->batch);
 	if (s->instance)
 		free(s->instance);
@@ -634,6 +692,24 @@ server_shutdown(server *s)
 		freeaddrinfo(s->saddr);
 	free((char *)s->ip);
 	s->ip = NULL;
+	free(s);
+}
+
+/**
+ * Swaps the queue between server l to r.  This is assumes both l and r
+ * are not running.
+ */
+void
+server_swap_queue(server *l, server *r)
+{
+	queue *t;
+
+	assert(l->keep_running == 0 || l->tid == 0);
+	assert(r->keep_running == 0 || r->tid == 0);
+
+	t = l->queue;
+	l->queue = r->queue;
+	r->queue = t;
 }
 
 /**
@@ -686,7 +762,7 @@ server_failed(server *s)
 {
 	if (s == NULL)
 		return 0;
-	return s->failure;
+	return __sync_add_and_fetch(&(s->failure), 0);
 }
 
 /**
@@ -697,7 +773,7 @@ server_get_ticks(server *s)
 {
 	if (s == NULL)
 		return 0;
-	return s->ticks;
+	return __sync_add_and_fetch(&(s->ticks), 0);
 }
 
 /**
@@ -710,7 +786,7 @@ server_get_ticks_sub(server *s)
 	size_t d;
 	if (s == NULL)
 		return 0;
-	d = s->ticks - s->prevticks;
+	d = __sync_add_and_fetch(&(s->ticks), 0) - s->prevticks;
 	s->prevticks += d;
 	return d;
 }
@@ -723,7 +799,7 @@ server_get_metrics(server *s)
 {
 	if (s == NULL)
 		return 0;
-	return s->metrics;
+	return __sync_add_and_fetch(&(s->metrics), 0);
 }
 
 /**
@@ -735,7 +811,7 @@ server_get_metrics_sub(server *s)
 	size_t d;
 	if (s == NULL)
 		return 0;
-	d = s->metrics - s->prevmetrics;
+	d = __sync_add_and_fetch(&(s->metrics), 0) - s->prevmetrics;
 	s->prevmetrics += d;
 	return d;
 }
@@ -748,7 +824,7 @@ server_get_dropped(server *s)
 {
 	if (s == NULL)
 		return 0;
-	return s->dropped;
+	return __sync_add_and_fetch(&(s->dropped), 0);
 }
 
 /**
@@ -760,7 +836,7 @@ server_get_dropped_sub(server *s)
 	size_t d;
 	if (s == NULL)
 		return 0;
-	d = s->dropped - s->prevdropped;
+	d = __sync_add_and_fetch(&(s->dropped), 0) - s->prevdropped;
 	s->prevdropped += d;
 	return d;
 }
@@ -775,7 +851,7 @@ server_get_stalls(server *s)
 {
 	if (s == NULL)
 		return 0;
-	return s->stalls;
+	return __sync_add_and_fetch(&(s->stalls), 0);
 }
 
 /**
@@ -787,7 +863,7 @@ server_get_stalls_sub(server *s)
 	size_t d;
 	if (s == NULL)
 		return 0;
-	d = s->stalls - s->prevstalls;
+	d = __sync_add_and_fetch(&(s->stalls), 0) - s->prevstalls;
 	s->prevstalls += d;
 	return d;
 }

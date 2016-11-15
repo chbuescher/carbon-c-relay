@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,7 +30,8 @@
 
 /* This value is hardwired in the carbon sources, and necessary to get
  * fair (re)balancing of metrics in the hash ring.  Because the value
- * seems reasonable, we use the same value for all hash implementations. */
+ * seems reasonable, we use the same value for carbon and fnv1a hash
+ * implementations. */
 #define HASH_REPLICAS  100
 
 typedef struct _ring_entry {
@@ -44,6 +45,8 @@ struct _ch_ring {
 	ch_type type;
 	unsigned char hash_replicas;
 	ch_ring_entry *entries;
+	ch_ring_entry **entrylist;  /* only used with jump hash */
+	int entrycnt;
 };
 
 
@@ -75,6 +78,27 @@ fnv1a_hashpos(const char *key, const char *end)
 	fnv1a_32(hash, key, key, end);
 
 	return (unsigned short)((hash >> 16) ^ (hash & (unsigned int)0xFFFF));
+}
+
+/**
+ * Computes the bucket number for key in the range [0, bckcnt).  The
+ * algorithm used is the jump consistent hash by Lamping and Veach.
+ */
+static unsigned int
+jump_bucketpos(unsigned long long int key, int bckcnt)
+{
+	long long int b = -1, j = 0;
+
+	while (j < bckcnt) {
+		b = j;
+		key = key * 2862933555777941757ULL + 1;
+		j = (long long int)((double)(b + 1) *
+				((double)(1LL << 31) / (double)((key >> 33) + 1))
+			);
+	}
+
+	/* b cannot exceed the range of bckcnt, see while condition */
+	return (unsigned int)b;
 }
 
 /**
@@ -134,6 +158,18 @@ entrycmp_fnv1a(const void *l, const void *r)
 	return 0;
 }
 
+/**
+ * Sort comparator for ch_ring_entry structs on instance only.
+ */
+static int
+entrycmp_jump_fnv1a(const void *l, const void *r)
+{
+	char *si_l = server_instance(((ch_ring_entry *)l)->server);
+	char *si_r = server_instance(((ch_ring_entry *)r)->server);
+
+	return strcmp(si_l ? si_l : "", si_r ? si_r : "");
+}
+
 ch_ring *
 ch_new(ch_type type)
 {
@@ -142,8 +178,18 @@ ch_new(ch_type type)
 	if (ret == NULL)
 		return NULL;
 	ret->type = type;
-	ret->hash_replicas = HASH_REPLICAS;
+	switch (ret->type) {
+		case CARBON:
+		case FNV1a:
+			ret->hash_replicas = HASH_REPLICAS;
+			break;
+		default:
+			ret->hash_replicas = 1;
+			break;
+	}
 	ret->entries = NULL;
+	ret->entrylist = NULL;
+	ret->entrycnt = 0;
 
 	return ret;
 }
@@ -215,6 +261,13 @@ ch_addnode(ch_ring *ring, server *s)
 			}
 			cmp = *entrycmp_fnv1a;
 			break;
+		case JUMP_FNV1a:
+			entries[0].pos = 0;
+			entries[0].server = s;
+			entries[0].next = NULL;
+			entries[0].malloced = 0;
+			cmp = *entrycmp_jump_fnv1a;
+			break;
 	}
 
 	/* sort to allow merge joins later down the road */
@@ -232,7 +285,7 @@ ch_addnode(ch_ring *ring, server *s)
 		last = NULL;
 		assert(ring->hash_replicas > 0);
 		for (w = ring->entries; w != NULL && i < ring->hash_replicas; ) {
-			if (cmp(&w->pos, &entries[i].pos) <= 0) {
+			if (cmp(w, &entries[i]) <= 0) {
 				last = w;
 				w = w->next;
 			} else {
@@ -252,6 +305,28 @@ ch_addnode(ch_ring *ring, server *s)
 			last->next = &entries[i];
 			for (i = i + 1; i < ring->hash_replicas; i++)
 				entries[i - 1].next = &entries[i];
+		}
+	}
+
+	if (ring->type == JUMP_FNV1a) {
+		ch_ring_entry *w;
+
+		/* count the ring, pos is purely cosmetic, it isn't used */
+		for (w = ring->entries, i = 0; w != NULL; w = w->next, i++)
+			w->pos = i;
+		ring->entrycnt = i;
+		/* this is really wasteful, but optimising this isn't worth it
+		 * since it's called only a few times during config parsing */
+		if (ring->entrylist != NULL)
+			free(ring->entrylist);
+		ring->entrylist = malloc(sizeof(ch_ring_entry *) * ring->entrycnt);
+		for (w = ring->entries, i = 0; w != NULL; w = w->next, i++)
+			ring->entrylist[i] = w;
+
+		if (i == CONN_DESTS_SIZE) {
+			logerr("ch_addnode: nodes in use exceeds CONN_DESTS_SIZE, "
+					"increase CONN_DESTS_SIZE in router.h\n");
+			return NULL;
 		}
 	}
 
@@ -284,6 +359,41 @@ ch_get_nodes(
 		case FNV1a:
 			pos = fnv1a_hashpos(metric, firstspace);
 			break;
+		case JUMP_FNV1a: {
+			/* this is really a short route, since the jump hash gives
+			 * us a bucket immediately */
+			unsigned long long int hash;
+			ch_ring_entry *bcklst[CONN_DESTS_SIZE];
+			const char *p;
+
+			i = ring->entrycnt;
+			pos = replcnt;
+
+			memcpy(bcklst, ring->entrylist, sizeof(bcklst[0]) * i);
+			fnv1a_64(hash, p, metric, firstspace);
+
+			while (i > 0) {
+				j = jump_bucketpos(hash, i);
+
+				(*ret).dest = bcklst[j]->server;
+				(*ret).metric = strdup(metric);
+				ret++;
+
+				if (--pos == 0)
+					break;
+
+				/* use xorshift to generate a different hash for input
+				 * in the hump hash again */
+				hash ^= hash >> 12;
+				hash ^= hash << 25;
+				hash ^= hash >> 27;
+				hash *= 2685821657736338717ULL;
+
+				/* remove the server we just selected, such that we can
+				 * be sure the next iteration will fetch another server */
+				bcklst[j] = bcklst[--i];
+			}
+		}	return;
 	}
 
 	assert(ring->entries);
@@ -335,6 +445,8 @@ ch_printhashring(ch_ring *ring, FILE *f)
 			column = 0;
 		}
 	}
+	if (column != 0)
+		fprintf(f, "\n");
 }
 
 unsigned short
@@ -345,6 +457,11 @@ ch_gethashpos(ch_ring *ring, const char *key, const char *end)
 			return carbon_hashpos(key, end);
 		case FNV1a:
 			return fnv1a_hashpos(key, end);
+		case JUMP_FNV1a: {
+			unsigned long long int hash;
+			fnv1a_64(hash, key, key, end);
+			return jump_bucketpos(hash, ring->entrycnt);
+		}
 		default:
 			assert(0);  /* this shouldn't happen */
 	}
@@ -353,7 +470,8 @@ ch_gethashpos(ch_ring *ring, const char *key, const char *end)
 }
 
 /**
- * Frees the ring structure and its added nodes.
+ * Frees the ring structure and its added nodes, leaves the referenced
+ * servers untouched.
  */
 void
 ch_free(ch_ring *ring)
@@ -362,8 +480,6 @@ ch_free(ch_ring *ring)
 	ch_ring_entry *w = NULL;
 
 	for (; ring->entries != NULL; ring->entries = ring->entries->next) {
-		server_shutdown(ring->entries->server);
-
 		if (ring->entries->malloced) {
 			if (deletes == NULL) {
 				w = deletes = ring->entries;
@@ -373,13 +489,17 @@ ch_free(ch_ring *ring)
 		}
 	}
 
-	assert(w != NULL);
-	w->next = NULL;
-	while (deletes != NULL) {
-		w = deletes->next;
-		free(deletes);
-		deletes = w;
+	if (w != NULL) {
+		w->next = NULL;
+		while (deletes != NULL) {
+			w = deletes->next;
+			free(deletes);
+			deletes = w;
+		}
 	}
+
+	if (ring->entrylist != NULL)
+		free(ring->entrylist);
 
 	free(ring);
 }

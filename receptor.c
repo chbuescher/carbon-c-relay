@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,7 +46,7 @@ int
 bindlisten(
 		int ret_stream[], int *retlen_stream,
 		int ret_dgram[], int *retlen_dgram,
-		const char *interface, unsigned short port)
+		const char *interface, unsigned short port, unsigned int backlog)
 {
 	int sock;
 	int optval;
@@ -56,6 +56,7 @@ bindlisten(
 	char buf[128];
 	char saddr[INET6_ADDRSTRLEN];
 	int err;
+	int binderr = 0;
 	int curlen_stream = 0;
 	int curlen_dgram = 0;
 	int socktypes[] = {SOCK_STREAM, SOCK_DGRAM, 0};
@@ -64,7 +65,7 @@ bindlisten(
 	tv.tv_sec = 0;
 	tv.tv_usec = 500 * 1000;
 
-	for (; *socktype != 0; socktype++) {
+	for (; *socktype != 0 && binderr == 0; socktype++) {
 		memset(&hint, 0, sizeof(hint));
 		hint.ai_family = PF_UNSPEC;
 		hint.ai_socktype = *socktype;
@@ -84,8 +85,14 @@ bindlisten(
 				continue;
 			if (resw->ai_protocol != IPPROTO_TCP && resw->ai_protocol != IPPROTO_UDP)
 				continue;
-			if ((sock = socket(resw->ai_family, resw->ai_socktype, resw->ai_protocol)) < 0)
-				continue;
+			if ((sock = socket(resw->ai_family, resw->ai_socktype, resw->ai_protocol)) < 0) {
+				while (curlen_dgram > 0)
+					close(ret_dgram[--curlen_dgram]);
+				while (curlen_stream > 0)
+					close(ret_stream[--curlen_stream]);
+				binderr = 1;
+				break;
+			}
 
 			(void) setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 			optval = 1;  /* allow takeover */
@@ -93,11 +100,6 @@ bindlisten(
 			if (resw->ai_family == PF_INET6) {
 				optval = 1;
 				(void) setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &optval, sizeof(optval));
-			}
-
-			if (bind(sock, resw->ai_addr, resw->ai_addrlen) < 0) {
-				close(sock);
-				continue;
 			}
 
 			snprintf(saddr, sizeof(saddr), "(unknown)");
@@ -114,10 +116,28 @@ bindlisten(
 					break;
 			}
 
+			if (bind(sock, resw->ai_addr, resw->ai_addrlen) < 0) {
+				logerr("failed to bind on %s%d %s port %s\n",
+						resw->ai_protocol == IPPROTO_TCP ? "tcp" : "udp",
+						resw->ai_family == PF_INET6 ? 6 : 4, saddr, buf);
+				close(sock);
+				while (curlen_dgram > 0)
+					close(ret_dgram[--curlen_dgram]);
+				while (curlen_stream > 0)
+					close(ret_stream[--curlen_stream]);
+				binderr = 1;
+				break;
+			}
+
 			if (resw->ai_protocol == IPPROTO_TCP) {
-				if (listen(sock, 3) < 0) {  /* backlog of 3, enough? */
+				if (listen(sock, backlog) < 0) {
 					close(sock);
-					continue;
+					while (curlen_dgram > 0)
+						close(ret_dgram[--curlen_dgram]);
+					while (curlen_stream > 0)
+						close(ret_stream[--curlen_stream]);
+					binderr = 1;
+					break;
 				}
 				if (curlen_stream < *retlen_stream) {
 					logout("listening on tcp%d %s port %s\n",
@@ -161,7 +181,7 @@ bindlisten(
 			break;
 		}
 
-		if (listen(sock, 3) < 0) {  /* backlog of 3, enough? */
+		if (listen(sock, backlog) < 0) {
 			close(sock);
 			break;
 		}

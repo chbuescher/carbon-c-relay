@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@
 #define CH_RING void
 #endif
 typedef CH_RING ch_ring;
-typedef enum { CARBON, FNV1a } ch_type;
+typedef enum { CARBON, FNV1a, JUMP_FNV1a } ch_type;
 
 ch_ring *ch_new(ch_type type);
 ch_ring *ch_addnode(ch_ring *ring, server *s);

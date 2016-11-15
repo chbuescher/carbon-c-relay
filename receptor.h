@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 #ifndef RECEPTOR_H
 #define RECEPTOR_H 1
 
-int bindlisten(int ret_stream[], int *retlen_stream, int ret_dgram[], int *retlen_dgram, const char *interface, unsigned short port);
+int bindlisten(int ret_stream[], int *retlen_stream, int ret_dgram[], int *retlen_dgram, const char *interface, unsigned short port, unsigned int backlog);
 
 void destroy_usock(unsigned short port);
 

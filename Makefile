@@ -1,4 +1,4 @@
-# Copyright 2013-2015 Fabian Groffen
+# Copyright 2013-2016 Fabian Groffen
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +13,9 @@
 # limitations under the License.
 
 
-CFLAGS ?= -O2 -Wall
-# if your compiler doesn't support OpenMP, comment out this line, or
-# define OPENMP_FLAGS to be empty
-OPENMP_FLAGS ?= -fopenmp
-override CC += $(OPENMP_FLAGS)
+CFLAGS ?= -O2 -Wall -Wshadow
 
-GIT_VERSION := $(shell git describe --abbrev=6 --dirty --always || date +%F)
+GIT_VERSION := $(shell git describe --abbrev=6 --dirty --always 2>/dev/null || date +%F)
 GVCFLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"
 
 override CFLAGS += $(GVCFLAGS) -pthread
@@ -48,6 +44,14 @@ OBJS = \
 
 relay: $(OBJS)
 	$(CC) -o $@ $(LDFLAGS) $^ $(LIBS)
+
+man:
+	sed -e '/travis-ci.org\/grobian\/carbon-c-relay.svg/d' carbon-c-relay.md | \
+	ronn \
+		--manual="Graphite data collection and visualisation" \
+		--organization=Graphite \
+		--roff \
+	> carbon-c-relay.1
 
 VERSION = $(shell sed -n '/VERSION/s/^.*"\([0-9.]\+\)".*$$/\1/p' relay.h)
 dist:

@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,16 +18,27 @@
 #ifndef HAVE_RELAY_H
 #define HAVE_RELAY_H 1
 
-#define VERSION "1.1"
+#define VERSION "2.3"
 
 #define METRIC_BUFSIZ 8192
 
-enum rmode { NORMAL, DEBUG, SUBMISSION, TEST, DEBUGTEST };
+/* these are the various modes in which the relay runs */
+#define MODE_DEBUG      (1 << 0)
+#define MODE_SUBMISSION (1 << 1)
+#define MODE_TEST       (1 << 2)
+#define MODE_DAEMON     (1 << 3)
+#define MODE_TRACE      (1 << 4)
+extern unsigned char mode;
+
+#ifdef ENABLE_TRACE
+#define tracef(...) if (mode & MODE_TRACE) fprintf(stdout, __VA_ARGS__)
+#else
+#define tracef(...) /* noop */
+#endif
 
 typedef enum { CON_TCP, CON_UDP, CON_PIPE, CON_FILE } serv_ctype;
 
 extern char relay_hostname[];
-extern enum rmode mode;
 
 enum logdst { LOGOUT, LOGERR };
 

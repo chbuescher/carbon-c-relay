@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <math.h>
 #include <regex.h>
 #include <pthread.h>
+#include <errno.h>
 #include <assert.h>
 
 #include "relay.h"
@@ -33,8 +34,6 @@
 #include "fnv1a.h"
 
 static pthread_t aggregatorid;
-static aggregator *aggregators = NULL;
-static aggregator *lastaggr = NULL;
 static size_t prevreceived = 0;
 static size_t prevsent = 0;
 static size_t prevdropped = 0;
@@ -52,6 +51,7 @@ aggregator_new(
 		enum _aggr_timestamp tswhen)
 {
 	aggregator *ret = malloc(sizeof(aggregator));
+	int intconn[2];
 
 	if (ret == NULL)
 		return ret;
@@ -59,11 +59,14 @@ aggregator_new(
 	assert(interval != 0);
 	assert(interval < expire);
 
-	if (aggregators == NULL) {
-		aggregators = lastaggr = ret;
-	} else {
-		lastaggr = lastaggr->next = ret;
+	if (pipe(intconn) < 0) {
+		logerr("failed to create pipe for aggregator: %s\n",
+				strerror(errno));
+		free(ret);
+		return NULL;
 	}
+	ret->disp_conn = dispatch_addconnection_aggr(intconn[0]);
+	ret->fd = intconn[1];
 
 	ret->interval = interval;
 	ret->expire = expire;
@@ -74,8 +77,6 @@ aggregator_new(
 	ret->dropped = 0;
 	ret->computes = NULL;
 	ret->next = NULL;
-
-	pthread_mutex_init(&ret->bucketlock, NULL);
 
 	return ret;
 }
@@ -140,6 +141,7 @@ aggregator_add_compute(
 	ac->metric = strdup(metric);
 	memset(ac->invocations_ht, 0, sizeof(ac->invocations_ht));
 	ac->entries_needed = store;
+	pthread_rwlock_init(&ac->invlock, NULL);
 	ac->next = NULL;
 
 	return 0;
@@ -191,21 +193,24 @@ aggregator_putmetric(
 	struct _aggr_bucket *bucket;
 	struct _aggr_bucket_entries *entries;
 
+	/* do not accept new values when shutting down, issue #200 */
+	if (__sync_bool_compare_and_swap(&keep_running, 0, 0))
+		return;
+
 	/* get value */
 	if ((v = strchr(firstspace + 1, ' ')) == NULL) {
 		/* metric includes \n */
-		if (mode == DEBUG || mode == DEBUGTEST)
+		if (mode & MODE_DEBUG)
 			logerr("aggregator: dropping incorrect metric: %s",
 					metric);
 		return;
 	}
 
-	s->received++;
+	__sync_add_and_fetch(&s->received, 1);
 
 	val = atof(firstspace + 1);
 	epoch = atoll(v + 1);
 
-	pthread_mutex_lock(&s->bucketlock);
 	for (compute = s->computes; compute != NULL; compute = compute->next) {
 		if (nmatch == 0) {
 			ometric = compute->metric;
@@ -229,24 +234,31 @@ aggregator_putmetric(
 		omhtbucket =
 			((omhash >> AGGR_HT_POW_SIZE) ^ omhash) &
 			(((unsigned int)1 << AGGR_HT_POW_SIZE) - 1);
-		invocation = compute->invocations_ht[omhtbucket];
-		for (; invocation != NULL; invocation = invocation->next)
-			if (invocation->hash == omhash &&
-					strcmp(ometric, invocation->metric) == 0)  /* match */
+
+#define find_invocation(o) \
+		invocation = compute->invocations_ht[omhtbucket]; \
+		for (; invocation != NULL; invocation = invocation->next) \
+			if (invocation->hash == omhash && \
+					strcmp(o, invocation->metric) == 0)  /* match */ \
 				break;
+		pthread_rwlock_wrlock(&compute->invlock);
+		find_invocation(ometric);
+
 		if (invocation == NULL) {  /* no match, add */
-			int i;
+			long long int i;
 			time_t now;
 
 			if ((invocation = malloc(sizeof(*invocation))) == NULL) {
 				logerr("aggregator: out of memory creating %s from %s",
 						ometric, metric);
+				pthread_rwlock_unlock(&compute->invlock);
 				continue;
 			}
 			if ((invocation->metric = strdup(ometric)) == NULL) {
 				logerr("aggregator: out of memory creating %s from %s",
 						ometric, metric);
 				free(invocation);
+				pthread_rwlock_unlock(&compute->invlock);
 				continue;
 			}
 			invocation->hash = omhash;
@@ -273,11 +285,15 @@ aggregator_putmetric(
 						ometric, metric);
 				free(invocation->metric);
 				free(invocation);
+				pthread_rwlock_unlock(&compute->invlock);
 				continue;
 			}
 			for (i = 0; i < s->bucketcnt; i++) {
-				invocation->buckets[i].start = now + (i * s->interval);
+				invocation->buckets[i].start =
+					now + (i * (long long int)s->interval);
 				invocation->buckets[i].cnt = 0;
+				invocation->buckets[i].entries.size = 0;
+				invocation->buckets[i].entries.values = NULL;
 			}
 
 			invocation->next = compute->invocations_ht[omhtbucket];
@@ -289,18 +305,20 @@ aggregator_putmetric(
 		itime = epoch - invocation->buckets[0].start;
 		if (itime < 0) {
 			/* drop too old metric */
-			s->dropped++;
+			__sync_add_and_fetch(&s->dropped, 1);
+			pthread_rwlock_unlock(&compute->invlock);
 			continue;
 		}
 
 		slot = itime / s->interval;
 		if (slot >= s->bucketcnt) {
-			if (mode == DEBUG || mode == DEBUGTEST)
+			if (mode & MODE_DEBUG)
 				logerr("aggregator: dropping metric too far in the "
 						"future (%lld > %lld): %s from %s", epoch,
 						invocation->buckets[s->bucketcnt - 1].start,
 						ometric, metric);
-			s->dropped++;
+			__sync_add_and_fetch(&s->dropped, 1);
+			pthread_rwlock_unlock(&compute->invlock);
 			continue;
 		}
 
@@ -320,7 +338,8 @@ aggregator_putmetric(
 		if (compute->entries_needed) {
 			if (bucket->cnt == entries->size) {
 #define E_I_SZ 64
-				double *new = realloc(entries->values, entries->size + E_I_SZ);
+				double *new = realloc(entries->values,
+						sizeof(double) * (entries->size + E_I_SZ));
 				if (new == NULL) {
 					logerr("aggregator: out of memory creating entry bucket "
 							"(%s from %s)", ometric, metric);
@@ -333,8 +352,9 @@ aggregator_putmetric(
 				entries->values[bucket->cnt] = val;
 		}
 		bucket->cnt++;
+
+		pthread_rwlock_unlock(&compute->invlock);
 	}
-	pthread_mutex_unlock(&s->bucketlock);
 
 	return;
 }
@@ -354,6 +374,7 @@ cmp_entry(const void *l, const void *r)
 static void *
 aggregator_expire(void *sub)
 {
+	aggregator *aggrs = (aggregator *)sub;
 	time_t now;
 	aggregator *s;
 	struct _aggr_bucket *b;
@@ -361,10 +382,11 @@ aggregator_expire(void *sub)
 	struct _aggr_invocations *inv;
 	struct _aggr_invocations *lastinv;
 	double *values;
+	size_t len = 0;
 	int i;
+	size_t k;
 	unsigned char j;
 	int work;
-	server *submission = (server *)sub;
 	char metric[METRIC_BUFSIZ];
 	char isempty;
 	long long int ts = 0;
@@ -372,18 +394,19 @@ aggregator_expire(void *sub)
 	while (1) {
 		work = 0;
 
-		for (s = aggregators; s != NULL; s = s->next) {
+		for (s = aggrs; s != NULL; s = s->next) {
 			/* send metrics for buckets that are completely past the
 			 * expiry time, unless we are shutting down, then send
 			 * metrics for all buckets that have completed */
-			now = time(NULL) + (keep_running ? 0 : s->expire - s->interval);
+			now = time(NULL) + (__sync_bool_compare_and_swap(&keep_running, 1, 1) ? 0 : s->expire - s->interval);
 			for (c = s->computes; c != NULL; c = c->next) {
+				pthread_rwlock_wrlock(&c->invlock);
 				for (i = 0; i < (1 << AGGR_HT_POW_SIZE); i++) {
 					lastinv = NULL;
 					isempty = 0;
 					for (inv = c->invocations_ht[i]; inv != NULL; ) {
 						while (inv->buckets[0].start +
-								(keep_running ? inv->expire : s->expire) < now)
+								(__sync_bool_compare_and_swap(&keep_running, 1, 1) ? inv->expire : s->expire) < now)
 						{
 							/* yay, let's produce something cool */
 							b = &inv->buckets[0];
@@ -405,37 +428,36 @@ aggregator_expire(void *sub)
 								}
 								switch (c->type) {
 									case SUM:
-										snprintf(metric, sizeof(metric),
+										len = snprintf(metric, sizeof(metric),
 												"%s %f %lld\n",
 												inv->metric, b->sum, ts);
 										break;
 									case CNT:
-										snprintf(metric, sizeof(metric),
-												"%s %zd %lld\n",
+										len = snprintf(metric, sizeof(metric),
+												"%s %zu %lld\n",
 												inv->metric, b->cnt, ts);
 										break;
 									case MAX:
-										snprintf(metric, sizeof(metric),
+										len = snprintf(metric, sizeof(metric),
 												"%s %f %lld\n",
 												inv->metric, b->max, ts);
 										break;
 									case MIN:
-										snprintf(metric, sizeof(metric),
+										len = snprintf(metric, sizeof(metric),
 												"%s %f %lld\n",
 												inv->metric, b->min, ts);
 										break;
 									case AVG:
-										snprintf(metric, sizeof(metric),
+										len = snprintf(metric, sizeof(metric),
 												"%s %f %lld\n",
 												inv->metric,
 												b->sum / (double)b->cnt, ts);
 										break;
 									case MEDN:
 										/* median == 50th percentile */
-									case PCTL: {
+									case PCTL:
 										/* nearest rank method */
-										size_t n =
-											(int)(((double)c->percentile/100.0 *
+										k = (int)(((double)c->percentile/100.0 *
 														(double)b->cnt) + 0.9);
 										values = b->entries.values;
 										/* TODO: lazy approach, in case
@@ -446,54 +468,68 @@ aggregator_expire(void *sub)
 										 * iso sorting the full array */
 										qsort(values, b->cnt,
 												sizeof(double), cmp_entry);
-										snprintf(metric, sizeof(metric),
+										len = snprintf(metric, sizeof(metric),
 												"%s %f %lld\n",
 												inv->metric,
-												values[n - 1],
-												b->start + s->interval);
-									}	break;
+												values[k - 1],
+												ts);
+										break;
 									case VAR:
 									case SDEV: {
 										double avg = b->sum / (double)b->cnt;
 										double ksum = 0;
 										values = b->entries.values;
-										for (i = 0; i < b->cnt; i++)
-											ksum += pow(values[i] - avg, 2);
+										for (k = 0; k < b->cnt; k++)
+											ksum += pow(values[k] - avg, 2);
 										ksum /= (double)b->cnt;
-										snprintf(metric, sizeof(metric),
+										len = snprintf(metric, sizeof(metric),
 												"%s %f %lld\n",
 												inv->metric,
 												c->type == VAR ? ksum :
 													sqrt(ksum),
-												b->start + s->interval);
+												ts);
 									}	break;
+									default:
+									   assert(0);  /* for compiler (len) */
 								}
-								server_send(submission, strdup(metric), 1);
-								s->sent++;
+								ts = write(s->fd, metric, len);
+								if (ts < 0) {
+									logerr("aggregator: failed to write to "
+											"pipe (fd=%d): %s\n",
+											s->fd, strerror(errno));
+									__sync_add_and_fetch(&s->dropped, 1);
+								} else if (ts < len) {
+									logerr("aggregator: uncomplete write on "
+											"pipe (fd=%d)\n", s->fd);
+									__sync_add_and_fetch(&s->dropped, 1);
+								} else {
+									__sync_add_and_fetch(&s->sent, 1);
+								}
 							}
 
 							/* move the bucket to the end, to make room for
 							 * new ones */
-							pthread_mutex_lock(&s->bucketlock);
-							memmove(&inv->buckets[0], &inv->buckets[1],
+							b = &inv->buckets[0];
+							len = b->entries.size;
+							values = b->entries.values;
+							memmove(b, &inv->buckets[1],
 									sizeof(*b) * (s->bucketcnt - 1));
 							b = &inv->buckets[s->bucketcnt - 1];
 							b->cnt = 0;
 							b->start =
 								inv->buckets[s->bucketcnt - 2].start +
 								s->interval;
-							pthread_mutex_unlock(&s->bucketlock);
+							b->entries.size = len;
+							b->entries.values = values;
 
 							work++;
 						}
 
 						if (isempty) {
 							/* see if the remaining buckets are empty too */
-							pthread_mutex_lock(&s->bucketlock);
 							for (j = 0; j < s->bucketcnt; j++) {
 								if (inv->buckets[j].cnt != 0) {
 									isempty = 0;
-									pthread_mutex_unlock(&s->bucketlock);
 									break;
 								}
 							}
@@ -515,22 +551,55 @@ aggregator_expire(void *sub)
 								free(inv);
 								inv = c->invocations_ht[i];
 							}
-							pthread_mutex_unlock(&s->bucketlock);
 						} else {
 							lastinv = inv;
 							inv = inv->next;
 						}
 					}
 				}
+				pthread_rwlock_unlock(&c->invlock);
 			}
 		}
 
 		if (work == 0) {
-			if (!keep_running)
+			if (__sync_bool_compare_and_swap(&keep_running, 0, 0))
 				break;
 			/* nothing done, avoid spinlocking */
 			usleep(250 * 1000);  /* 250ms */
 		}
+	}
+
+	/* free up value buckets */
+	while ((s = aggrs) != NULL) {
+		while (s->computes != NULL) {
+			c = s->computes;
+
+			free((void *)c->metric);
+			for (i = 0; i < 1 << AGGR_HT_POW_SIZE; i++) {
+				inv = c->invocations_ht[i];
+
+				while (inv != NULL) {
+					struct _aggr_invocations *invocation = inv;
+
+					free(inv->metric);
+					if (c->entries_needed)
+						for (j = 0; j < s->bucketcnt; j++)
+							if (inv->buckets[j].entries.values)
+								free(inv->buckets[j].entries.values);
+					free(inv->buckets);
+
+					inv = invocation->next;
+					free(invocation);
+				}
+			}
+
+			pthread_rwlock_destroy(&c->invlock);
+
+			s->computes = c->next;
+			free(c);
+		}
+		aggrs = aggrs->next;
+		free(s);
 	}
 
 	return NULL;
@@ -540,12 +609,12 @@ aggregator_expire(void *sub)
  * Returns the number of aggregators defined.
  */
 size_t
-aggregator_numaggregators(void)
+aggregator_numaggregators(aggregator *aggrs)
 {
 	size_t totaggregators = 0;
 	aggregator *a;
 
-	for (a = aggregators; a != NULL; a = a->next)
+	for (a = aggrs; a != NULL; a = a->next)
 		totaggregators++;
 
 	return totaggregators;
@@ -555,13 +624,13 @@ aggregator_numaggregators(void)
  * Returns the total number of computations defined.
  */
 size_t
-aggregator_numcomputes(void)
+aggregator_numcomputes(aggregator *aggrs)
 {
 	size_t totcomputes = 0;
 	aggregator *a;
 	struct _aggr_computes *c;
 
-	for (a = aggregators; a != NULL; a = a->next)
+	for (a = aggrs; a != NULL; a = a->next)
 		for (c = a->computes; c != NULL; c = c->next)
 			totcomputes++;
 
@@ -573,9 +642,10 @@ aggregator_numcomputes(void)
  * failed, true otherwise.
  */
 int
-aggregator_start(server *submission)
+aggregator_start(aggregator *aggrs)
 {
-	if (pthread_create(&aggregatorid, NULL, aggregator_expire, submission) != 0)
+	keep_running = 1;
+	if (pthread_create(&aggregatorid, NULL, aggregator_expire, aggrs) != 0)
 		return 0;
 
 	return 1;
@@ -587,7 +657,7 @@ aggregator_start(server *submission)
 void
 aggregator_stop(void)
 {
-	keep_running = 0;
+	__sync_bool_compare_and_swap(&keep_running, 1, 0);
 	pthread_join(aggregatorid, NULL);
 }
 
@@ -595,13 +665,12 @@ aggregator_stop(void)
  * Returns an approximate number of received metrics by all aggregators.
  */
 size_t
-aggregator_get_received(void)
+aggregator_get_received(aggregator *a)
 {
 	size_t totreceived = 0;
-	aggregator *a;
 
-	for (a = aggregators; a != NULL; a = a->next)
-		totreceived += a->received;
+	for ( ; a != NULL; a = a->next)
+		totreceived += __sync_add_and_fetch(&a->received, 0);
 
 	return totreceived;
 }
@@ -611,11 +680,10 @@ aggregator_get_received(void)
  * since the last call to this function.
  */
 inline size_t
-aggregator_get_received_sub()
+aggregator_get_received_sub(aggregator *aggrs)
 {
-	size_t d = aggregator_get_received();
-	size_t r = d - prevreceived;
-	prevreceived += d;
+	size_t r = aggregator_get_received(aggrs) - prevreceived;
+	prevreceived += r;
 	return r;
 }
 
@@ -623,13 +691,12 @@ aggregator_get_received_sub()
  * Returns an approximate number of metrics sent by all aggregators.
  */
 size_t
-aggregator_get_sent(void)
+aggregator_get_sent(aggregator *a)
 {
 	size_t totsent = 0;
-	aggregator *a;
 
-	for (a = aggregators; a != NULL; a = a->next)
-		totsent += a->sent;
+	for ( ; a != NULL; a = a->next)
+		totsent += __sync_add_and_fetch(&a->sent, 0);
 
 	return totsent;
 }
@@ -639,11 +706,10 @@ aggregator_get_sent(void)
  * since the last call to this function.
  */
 inline size_t
-aggregator_get_sent_sub()
+aggregator_get_sent_sub(aggregator *aggrs)
 {
-	size_t d = aggregator_get_sent();
-	size_t r = d - prevsent;
-	prevsent += d;
+	size_t r = aggregator_get_sent(aggrs) - prevsent;
+	prevsent += r;
 	return r;
 }
 
@@ -653,13 +719,12 @@ aggregator_get_sent_sub()
  * time) or if they are too much in the future.
  */
 size_t
-aggregator_get_dropped(void)
+aggregator_get_dropped(aggregator *a)
 {
 	size_t totdropped = 0;
-	aggregator *a;
 
-	for (a = aggregators; a != NULL; a = a->next)
-		totdropped += a->dropped;
+	for ( ; a != NULL; a = a->next)
+		totdropped += __sync_add_and_fetch(&a->dropped, 0);
 
 	return totdropped;
 }
@@ -669,10 +734,9 @@ aggregator_get_dropped(void)
  * since the last call to this function.
  */
 inline size_t
-aggregator_get_dropped_sub()
+aggregator_get_dropped_sub(aggregator *aggrs)
 {
-	size_t d = aggregator_get_dropped();
-	size_t r = d - prevdropped;
-	prevdropped += d;
+	size_t r = aggregator_get_dropped(aggrs) - prevdropped;
+	prevdropped += r;
 	return r;
 }

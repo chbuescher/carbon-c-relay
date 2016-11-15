@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,20 +29,25 @@ int dispatch_addlistener(int sock);
 int dispatch_addlistener_udp(int sock);
 void dispatch_removelistener(int sock);
 int dispatch_addconnection(int sock);
+int dispatch_addconnection_aggr(int sock);
+void dispatch_set_bufsize(unsigned int sockbufsize);
 dispatcher *dispatch_new_listener(void);
-dispatcher *dispatch_new_connection(route *routes, char *allowed_chars);
+dispatcher *dispatch_new_connection(router *r, char *allowed_chars);
 void dispatch_stop(dispatcher *d);
 void dispatch_shutdown(dispatcher *d);
+void dispatch_free(dispatcher *d);
 size_t dispatch_get_ticks(dispatcher *self);
 size_t dispatch_get_metrics(dispatcher *self);
 size_t dispatch_get_blackholes(dispatcher *self);
+size_t dispatch_get_sleeps(dispatcher *self);
 size_t dispatch_get_ticks_sub(dispatcher *self);
 size_t dispatch_get_metrics_sub(dispatcher *self);
 size_t dispatch_get_blackholes_sub(dispatcher *self);
-char dispatch_busy(dispatcher *self);
+size_t dispatch_get_sleeps_sub(dispatcher *self);
 size_t dispatch_get_accepted_connections(void);
 size_t dispatch_get_closed_connections(void);
-void dispatch_schedulereload(dispatcher *d, route *r);
+void dispatch_hold(dispatcher *d);
+void dispatch_schedulereload(dispatcher *d, router *r);
 char dispatch_reloadcomplete(dispatcher *d);
 
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,13 @@
 #include <regex.h>
 
 #include "server.h"
+#include "aggregator.h"
+
+#define PMODE_NORM    (1 << 0)
+#define PMODE_AGGR    (1 << 1)
+#define PMODE_HASH    (1 << 2)
+#define PMODE_STUB    (1 << 3)
+#define PMODE_DEBUG   (PMODE_HASH | PMODE_STUB)
 
 #define CONN_DESTS_SIZE    64
 typedef struct {
@@ -29,19 +36,23 @@ typedef struct {
 	server *dest;
 } destination;
 
-typedef struct _cluster cluster;
-typedef struct _route route;
+typedef struct _router router;
 
 #define RE_MAX_MATCHES     64
 
-int router_readconfig(cluster **clret, route **rret, const char *path, size_t queuesize, size_t batchsize, unsigned short iotimeout);
-void router_optimise(route **routes);
+router *router_readconfig(router *orig, const char *path, size_t queuesize, size_t batchsize, int maxstalls, unsigned short iotimeout, unsigned int sockbufsize);
+void router_optimise(router *r);
+char router_printdiffs(router *old, router *new, FILE *out);
+void router_transplant_queues(router *new, router *old);
+char router_start(router *r);
 size_t router_rewrite_metric(char (*newmetric)[METRIC_BUFSIZ], char **newfirstspace, const char *metric, const char *firstspace, const char *replacement, const size_t nmatch, const regmatch_t *pmatch);
-void router_printconfig(FILE *f, char mode, cluster *clusters, route *routes);
-char router_route(destination ret[], size_t *retcnt, size_t retsize, char *srcaddr, char *metric, char *firstspace, route *routes);
-void router_test(char *metric_path, route *routes);
-server **router_getservers(cluster *clusters);
-void router_shutdown(void);
-void router_free(cluster *clusters, route *r);
+void router_printconfig(router *r, FILE *f, char mode);
+char router_route(router *r, destination ret[], size_t *retcnt, size_t retsize, char *srcaddr, char *metric, char *firstspace);
+void router_test(router *r, char *metric_path);
+server **router_getservers(router *r);
+aggregator *router_getaggregators(router *r);
+char *router_getcollectorstub(router *r);
+void router_shutdown(router *r);
+void router_free(router *r);
 
 #endif

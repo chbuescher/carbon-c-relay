@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -65,6 +65,11 @@ queue_new(size_t size)
 void
 queue_destroy(queue *q)
 {
+	const char *p;
+
+	/* drain queue not to leak the memory consumed by pending metrics */
+	while ((p = queue_dequeue(q)) != NULL)
+		free((char *)p);
 	q->len = 0;
 	pthread_mutex_destroy(&q->lock);
 	free(q->queue);
@@ -74,8 +79,8 @@ queue_destroy(queue *q)
 /**
  * Enqueues the string pointed to by p at queue q.  If the queue is
  * full, the oldest entry is dropped.  For this reason, enqueuing will
- * never fail.  This function assumes the pointer p is a private copy
- * for this queue, and hence will be freed once processed.
+ * never fail.  This function assumes the pointer p is a copy for this
+ * queue, that is returned on dequeue, or freed when dropped.
  */
 void
 queue_enqueue(queue *q, const char *p)
@@ -195,7 +200,11 @@ queue_putback(queue *q, const char *p)
 inline size_t
 queue_len(queue *q)
 {
-	return q->len;
+	size_t len;
+	pthread_mutex_lock(&q->lock);
+	len = q->len;
+	pthread_mutex_unlock(&q->lock);
+	return len;
 }
 
 /**
@@ -205,7 +214,7 @@ queue_len(queue *q)
 inline size_t
 queue_free(queue *q)
 {
-	return q->end - q->len;
+	return q->end - queue_len(q);
 }
 
 /**

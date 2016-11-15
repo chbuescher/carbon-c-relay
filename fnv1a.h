@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,3 +24,14 @@
 	hash = FNV1A_32_OFFSET; \
 	for (p = metric; p < firstspace; p++) \
 		hash = (hash ^ (unsigned int)*p) * FNV1A_32_PRIME;
+
+#define FNV1A_64_OFFSET   14695981039346656037ULL
+#define FNV1A_64_PRIME    1099511628211UL
+/**
+ * 64-bits unsigned FNV1a returning into hash, using p to as variable to
+ * walk over metric up to firstspace
+ */
+#define fnv1a_64(hash, p, metric, firstspace) \
+	hash = FNV1A_64_OFFSET; \
+	for (p = metric; p < firstspace; p++) \
+		hash = (hash ^ (unsigned long long int)*p) * FNV1A_64_PRIME;

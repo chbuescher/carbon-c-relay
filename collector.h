@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2015 Fabian Groffen
+ * Copyright 2013-2016 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 
 #include "dispatcher.h"
 #include "router.h"
+#include "aggregator.h"
 #include "server.h"
 #include "relay.h"
 
@@ -28,9 +29,9 @@ extern int collector_interval;
 #define timediff(X, Y) \
 	(Y.tv_sec > X.tv_sec ? (Y.tv_sec - X.tv_sec) * 1000 * 1000 + ((Y.tv_usec - X.tv_usec)) : Y.tv_usec - X.tv_usec)
 
-void collector_start(dispatcher **d, cluster *c, server *submission, char cum);
+void collector_start(dispatcher **d, router *rtr, server *submission, char cum);
 void collector_stop(void);
-void collector_schedulereload(cluster *c);
+void collector_schedulereload(router *rtr);
 char collector_reloadcomplete(void);
 
 #endif
