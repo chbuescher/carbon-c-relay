@@ -34,6 +34,9 @@
  * implementations. */
 #define HASH_REPLICAS  100
 
+#define LOOKUP_SIZE 256	// 8bit Index
+#define LOOKUP_BITS 8	// 16bit - Index Size
+
 typedef struct _ring_entry {
 	unsigned short pos;
 	unsigned char malloced:1;
@@ -46,6 +49,7 @@ struct _ch_ring {
 	unsigned char hash_replicas;
 	ch_ring_entry *entries;
 	ch_ring_entry **entrylist;  /* only used with jump hash */
+	ch_ring_entry *lookuptable[LOOKUP_SIZE]; /* used with carbon and fnv1a hash */
 	int entrycnt;
 };
 
@@ -322,12 +326,34 @@ ch_addnode(ch_ring *ring, server *s)
 		ring->entrylist = malloc(sizeof(ch_ring_entry *) * ring->entrycnt);
 		for (w = ring->entries, i = 0; w != NULL; w = w->next, i++)
 			ring->entrylist[i] = w;
+		/* fill the lookup table, is also cosmetic */
+		for (i = 0; i < LOOKUP_SIZE; i++)
+			ring->lookuptable[i] = ring->entries;
 
 		if (i == CONN_DESTS_SIZE) {
 			logerr("ch_addnode: nodes in use exceeds CONN_DESTS_SIZE, "
 					"increase CONN_DESTS_SIZE in router.h\n");
 			return NULL;
 		}
+	}
+	else { /* CARBON or FNV1a */
+		ch_ring_entry *w, *lastw = ring->entries;
+		unsigned short idx;
+
+		/* fill the lookup table */
+		for (i = 0; i < LOOKUP_SIZE; i++)
+			ring->lookuptable[i] = NULL;
+
+		for (w = ring->entries; w != NULL; w = w->next) {
+			idx = w->pos >> LOOKUP_BITS;
+			for (i = idx; ring->lookuptable[i] == NULL && i > 0; i--)
+				ring->lookuptable[i] = w;
+
+			lastw = w;
+		}
+
+		for (i = LOOKUP_SIZE - 1; ring->lookuptable[i] == NULL && i > 0; i--)
+			ring->lookuptable[i] = lastw;
 	}
 
 	return ring;
@@ -399,9 +425,8 @@ ch_get_nodes(
 	assert(ring->entries);
 
 	/* implement behaviour of Python's bisect_left on the ring (used in
-	 * carbon hash source), one day we might want to implement it as
-	 * real binary search iso forward pointer chasing */
-	for (w = ring->entries, i = 0; w != NULL; i++, w = w->next)
+	 * carbon hash source), use lookup table to avoid list scan */
+	for (w = ring->lookuptable[pos >> LOOKUP_BITS]; w != NULL; w = w->next)
 		if (w->pos >= pos)
 			break;
 	/* now fetch enough unique servers to match the requested count */
