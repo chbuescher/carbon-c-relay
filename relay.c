@@ -49,8 +49,8 @@ static int queuesize = 25000;
 static int maxstalls = 4;
 static unsigned short iotimeout = 600;
 static int sockbufsize = 0;
-static dispatcher **workers = NULL;
-static char workercnt = 0;
+dispatcher **workers = NULL;
+char workercnt = 0;
 static router *rtr = NULL;
 static server *internal_submission = NULL;
 static char *relay_logfile = NULL;
@@ -690,16 +690,16 @@ main(int argc, char * const argv[])
 
 	aggrs = router_getaggregators(rtr);
 	numaggregators = aggregator_numaggregators(aggrs);
-	if (numaggregators > 10 && !(mode & MODE_DEBUG)) {
+	if (numaggregators > 10 && mode & MODE_DEBUG) {
 		fprintf(relay_stdout, "parsed configuration follows:\n"
 				"(%zu aggregations with %zu computations omitted "
 				"for brevity)\n",
 				numaggregators, aggregator_numcomputes(aggrs));
-		router_printconfig(rtr, relay_stdout, PMODE_NORM);
+		router_printconfig(rtr, relay_stdout, 0);
 	} else {
 		fprintf(relay_stdout, "parsed configuration follows:\n");
 		router_printconfig(rtr, relay_stdout,
-				PMODE_AGGR + (mode & MODE_DEBUG ? PMODE_DEBUG : PMODE_NORM));
+				1 + (mode & MODE_DEBUG ? 2 : 0));
 	}
 	fprintf(relay_stdout, "\n");
 
@@ -745,29 +745,11 @@ main(int argc, char * const argv[])
 		return 1;
 	}
 
-	if (bindlisten(stream_sock, &stream_socklen,
-				dgram_sock, &dgram_socklen,
-				listeninterface, listenport, listenbacklog) < 0) {
-		logerr("failed to bind on port %s:%d: %s\n",
-				listeninterface == NULL ? "" : listeninterface,
-				listenport, strerror(errno));
-		return -1;
-	}
-	dispatch_set_bufsize(sockbufsize);
-	for (ch = 0; ch < stream_socklen; ch++) {
-		if (dispatch_addlistener(stream_sock[ch]) != 0) {
-			logerr("failed to add listener\n");
-			return -1;
-		}
-	}
-	for (ch = 0; ch < dgram_socklen; ch++) {
-		if (dispatch_addlistener_udp(dgram_sock[ch]) != 0) {
-			logerr("failed to listen to datagram socket\n");
-			return -1;
-		}
-	}
-	if ((workers[0] = dispatch_new_listener()) == NULL)
+	dispatch_initlisteners();
+
+	if ((workers[0] = dispatch_new_listener(sockbufsize)) == NULL)
 		logerr("failed to add listener\n");
+	usleep(10000);
 
 	if (allowed_chars == NULL)
 		allowed_chars = "-_:#";
@@ -783,6 +765,27 @@ main(int argc, char * const argv[])
 	if (id < 1 + workercnt) {
 		logerr("shutting down due to errors\n");
 		keep_running = 0;
+	}
+
+	if (bindlisten(stream_sock, &stream_socklen,
+				dgram_sock, &dgram_socklen,
+				listeninterface, listenport, listenbacklog) < 0) {
+		logerr("failed to bind on port %s:%d: %s\n",
+				listeninterface == NULL ? "" : listeninterface,
+				listenport, strerror(errno));
+		return -1;
+	}
+	for (ch = 0; ch < stream_socklen; ch++) {
+		if (dispatch_addlistener_tcp(stream_sock[ch]) != 0) {
+			logerr("failed to add listener\n");
+			return -1;
+		}
+	}
+	for (ch = 0; ch < dgram_socklen; ch++) {
+		if (dispatch_addlistener_udp(dgram_sock[ch]) != 0) {
+			logerr("failed to listen to datagram socket\n");
+			return -1;
+		}
 	}
 
 	/* server used for delivering metrics produced inside the relay,
@@ -811,7 +814,7 @@ main(int argc, char * const argv[])
 
 	logout("starting statistics collector\n");
 	if (internal_submission != NULL)
-		collector_start(&workers[1], rtr, internal_submission, smode == CUM);
+		collector_start(&workers[0], rtr, internal_submission, smode == CUM);
 
 	logout("starting servers\n");
 	if (router_start(rtr) != 0) {
@@ -835,6 +838,8 @@ main(int argc, char * const argv[])
 	/* make sure we don't accept anything new anymore */
 	for (ch = 0; ch < stream_socklen; ch++)
 		dispatch_removelistener(stream_sock[ch]);
+	for (ch = 0; ch < dgram_socklen; ch++)
+		dispatch_removelistener(dgram_sock[ch]);
 	destroy_usock(listenport);
 	logout("closed listeners for port %u\n", listenport);
 	/* since workers will be freed, stop querying the structures */
@@ -862,6 +867,8 @@ main(int argc, char * const argv[])
 	fprintf(relay_stdout, "\n");
 	fflush(relay_stdout);
 	free(workers);
+
+	dispatch_destroylisteners();
 
 	router_shutdown(rtr);
 	router_free(rtr);

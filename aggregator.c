@@ -65,7 +65,7 @@ aggregator_new(
 		free(ret);
 		return NULL;
 	}
-	ret->disp_conn = dispatch_addconnection_aggr(intconn[0]);
+	ret->disp_conn = dispatch_addlistener(intconn[0], 1);
 	ret->fd = intconn[1];
 
 	ret->interval = interval;

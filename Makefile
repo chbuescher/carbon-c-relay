@@ -20,7 +20,7 @@ GVCFLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"
 
 override CFLAGS += $(GVCFLAGS) -pthread
 
-SOCKET_LIBS =
+SOCKET_LIBS = -levent
 ifeq ($(shell uname), SunOS)
 SOCKET_LIBS += -lsocket  -lnsl
 endif

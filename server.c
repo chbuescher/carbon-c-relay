@@ -241,7 +241,7 @@ server_queuereader(void *d)
 						logerr("failed to create pipe: %s\n", strerror(errno));
 					continue;
 				}
-				dispatch_addconnection(intconn[0]);
+				dispatch_addlistener(intconn[0], 1);
 				self->fd = intconn[1];
 			} else if (self->ctype == CON_UDP) {
 				if ((self->fd = socket(self->saddr->ai_family,

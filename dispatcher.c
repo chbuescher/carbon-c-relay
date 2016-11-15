@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#define _GNU_SOURCE
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -29,8 +30,11 @@
 #include <sys/resource.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/queue.h>
+#include <event.h>
 
 #include "relay.h"
+#include "receptor.h"
 #include "router.h"
 #include "server.h"
 #include "collector.h"
@@ -41,22 +45,42 @@ enum conntype {
 	CONNECTION
 };
 
+enum listentype {
+	PLAN_ACTIVE,
+	ACTIVE,
+	PLAN_CLOSED,
+	CLOSED
+};
+
 typedef struct _connection {
 	int sock;
-	char takenby;   /* -2: being setup, -1: free, 0: not taken, >0: tid */
 	char srcaddr[24];  /* string representation of source address */
 	char buf[METRIC_BUFSIZ];
 	int buflen;
-	char needmore:1;
 	char noexpire:1;
-	char metric[METRIC_BUFSIZ];
+	dispatcher *self;
+	struct event ev_read;
+	int metric_sent;
+} connection;
+
+typedef struct _listener {
+	int sock;
+	char noclose;
+	enum listentype state;
+	struct event ev_read;
+	TAILQ_ENTRY(_listener) entries; /* pointers to the next and previous entries in the tail queue */
+} listener;
+
+typedef struct _metric_block {
+	char srcaddr[24];  /* string representation of source address */
+	char metric[METRIC_MAXLEN];
+	char *buffer;
+	size_t buf_len; 
 	destination dests[CONN_DESTS_SIZE];
 	size_t destlen;
-	struct timeval lastwork;
-	unsigned int maxsenddelay;
-	char hadwork:1;
-	char isaggr:1;
-} connection;
+	TAILQ_ENTRY(_metric_block) entries; /* pointers to the next and previous entries in the tail queue */
+	char _buf;
+} metric_block;
 
 struct _dispatcher {
 	pthread_t tid;
@@ -76,16 +100,23 @@ struct _dispatcher {
 	char route_refresh_pending;  /* full byte for atomic access */
 	char hold:1;
 	char *allowed_chars;
+	pthread_mutex_t conn_queue_lock;
+	pthread_cond_t conn_queue_cond;
+	struct event timer_ev;
+	TAILQ_HEAD(, _metric_block) metric_block_head;
 };
 
-static connection **listeners = NULL;
-static connection *connections = NULL;
-static size_t connectionslen = 0;
-pthread_rwlock_t listenerslock = PTHREAD_RWLOCK_INITIALIZER;
-pthread_rwlock_t connectionslock = PTHREAD_RWLOCK_INITIALIZER;
 static size_t acceptedconnections = 0;
 static size_t closedconnections = 0;
 static unsigned int sockbufsize = 0;
+static unsigned int idx = 0;
+
+static TAILQ_HEAD(, _listener) register_listener_head;
+static pthread_mutex_t register_listener_lock;
+static struct event_base *ev_base;
+
+extern dispatcher **workers;
+extern char workercnt;
 
 
 /**
@@ -111,52 +142,58 @@ dispatch_check_rlimit_and_warn(void)
 	}
 }
 
-#define MAX_LISTENERS 32  /* hopefully enough */
+void dispatch_initlisteners(void) {
+		pthread_mutex_init(&register_listener_lock, NULL);
+
+		pthread_mutex_lock(&register_listener_lock);
+		TAILQ_INIT(&register_listener_head);
+		pthread_mutex_unlock(&register_listener_lock);
+}
+
+void dispatch_destroylisteners(void) {
+		pthread_mutex_destroy(&register_listener_lock);
+}
 
 /**
  * Adds an (initial) listener socket to the chain of connections.
  * Listener sockets are those which need to be accept()-ed on.
  */
 int
-dispatch_addlistener(int sock)
+dispatch_addlistener(int sock, char noclose)
 {
-	connection *newconn;
-	int c;
+	listener *list;
 
-	pthread_rwlock_wrlock(&listenerslock);
-	if (listeners == NULL) {
-		if ((listeners = malloc(sizeof(connection *) * MAX_LISTENERS)) == NULL)
-		{
-			pthread_rwlock_unlock(&listenerslock);
-			return 1;
-		}
-		for (c = 0; c < MAX_LISTENERS; c++)
-			listeners[c] = NULL;
-	}
-	for (c = 0; c < MAX_LISTENERS; c++) {
-		if (listeners[c] == NULL) {
-			newconn = malloc(sizeof(connection));
-			if (newconn == NULL) {
-				pthread_rwlock_unlock(&listenerslock);
-				return 1;
+	(void) fcntl(sock, F_SETFL, O_NONBLOCK);
+
+	pthread_mutex_lock(&register_listener_lock);
+	/* search if socket is already in queue */
+	TAILQ_FOREACH(list, &register_listener_head, entries) {
+		if (list->sock == sock) {
+			if (PLAN_CLOSED == list->state) {
+				/* scheduled for unregister -> dont unregister */
+				list->state = ACTIVE;
 			}
-			(void) fcntl(sock, F_SETFL, O_NONBLOCK);
-			newconn->sock = sock;
-			newconn->takenby = 0;
-			newconn->buflen = 0;
+			else if (CLOSED == list->state) {
+				/* already unregistered -> renew */
+				list->state = PLAN_ACTIVE;
+			}
+			/* else already active or scheduled for register -> do nothing */
 
-			listeners[c] = newconn;
-			break;
+			pthread_mutex_unlock(&register_listener_lock);
+			return 0;
 		}
 	}
-	if (c == MAX_LISTENERS) {
-		logerr("cannot add new listener: "
-				"no more free listener slots (max = %zu)\n",
-				MAX_LISTENERS);
-		pthread_rwlock_unlock(&listenerslock);
-		return 1;
-	}
-	pthread_rwlock_unlock(&listenerslock);
+
+	/* insert new entry in queue */
+	list = malloc(sizeof(listener));
+	if (list == NULL)
+		return -1;
+	list->sock = sock;
+	list->noclose = noclose;
+	list->state = PLAN_ACTIVE;
+
+	TAILQ_INSERT_TAIL(&register_listener_head, list, entries);
+	pthread_mutex_unlock(&register_listener_lock);
 
 	return 0;
 }
@@ -168,138 +205,18 @@ dispatch_addlistener(int sock)
 void
 dispatch_removelistener(int sock)
 {
-	int c;
-	connection *conn;
+	listener *list;
 
-	pthread_rwlock_wrlock(&listenerslock);
-	/* find connection */
-	for (c = 0; c < MAX_LISTENERS; c++)
-		if (listeners[c] != NULL && listeners[c]->sock == sock)
-			break;
-	if (c == MAX_LISTENERS) {
-		/* not found?!? */
-		logerr("dispatch: cannot find listener!\n");
-		pthread_rwlock_unlock(&listenerslock);
-		return;
-	}
-	/* cleanup */
-	conn = listeners[c];
-	close(conn->sock);
-	free(conn);
-	listeners[c] = NULL;
-	pthread_rwlock_unlock(&listenerslock);
-}
-
-#define CONNGROWSZ  1024
-
-/**
- * Adds a connection socket to the chain of connections.
- * Connection sockets are those which need to be read from.
- * Returns the connection id, or -1 if a failure occurred.
- */
-int
-dispatch_addconnection(int sock)
-{
-	size_t c;
-	struct sockaddr_in6 saddr;
-	socklen_t saddr_len = sizeof(saddr);
-
-	pthread_rwlock_rdlock(&connectionslock);
-	for (c = 0; c < connectionslen; c++)
-		if (__sync_bool_compare_and_swap(&(connections[c].takenby), -1, -2))
-			break;
-	pthread_rwlock_unlock(&connectionslock);
-
-	if (c == connectionslen) {
-		connection *newlst;
-
-		pthread_rwlock_wrlock(&connectionslock);
-		if (connectionslen > c) {
-			/* another dispatcher just extended the list */
-			pthread_rwlock_unlock(&connectionslock);
-			return dispatch_addconnection(sock);
-		}
-		newlst = realloc(connections,
-				sizeof(connection) * (connectionslen + CONNGROWSZ));
-		if (newlst == NULL) {
-			logerr("cannot add new connection: "
-					"out of memory allocating more slots (max = %zu)\n",
-					connectionslen);
-
-			pthread_rwlock_unlock(&connectionslock);
-			return -1;
-		}
-
-		memset(&newlst[connectionslen], '\0',
-				sizeof(connection) * CONNGROWSZ);
-		for (c = connectionslen; c < connectionslen + CONNGROWSZ; c++)
-			newlst[c].takenby = -1;  /* free */
-		connections = newlst;
-		c = connectionslen;  /* for the setup code below */
-		newlst[c].takenby = -2;
-		connectionslen += CONNGROWSZ;
-
-		pthread_rwlock_unlock(&connectionslock);
-	}
-
-	/* figure out who's calling */
-	if (getpeername(sock, (struct sockaddr *)&saddr, &saddr_len) == 0) {
-		snprintf(connections[c].srcaddr, sizeof(connections[c].srcaddr),
-				"(unknown)");
-		switch (saddr.sin6_family) {
-			case PF_INET:
-				inet_ntop(saddr.sin6_family,
-						&((struct sockaddr_in *)&saddr)->sin_addr,
-						connections[c].srcaddr, sizeof(connections[c].srcaddr));
-				break;
-			case PF_INET6:
-				inet_ntop(saddr.sin6_family, &saddr.sin6_addr,
-						connections[c].srcaddr, sizeof(connections[c].srcaddr));
-				break;
+	close(sock);
+	pthread_mutex_lock(&register_listener_lock);
+	TAILQ_FOREACH(list, &register_listener_head, entries) {
+		if (list->sock == sock) {
+			list->state = PLAN_CLOSED;
 		}
 	}
-
-	(void) fcntl(sock, F_SETFL, O_NONBLOCK);
-	if (sockbufsize > 0) {
-		if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
-				&sockbufsize, sizeof(sockbufsize)) != 0)
-			;
-	}
-	connections[c].sock = sock;
-	connections[c].buflen = 0;
-	connections[c].needmore = 0;
-	connections[c].noexpire = 0;
-	connections[c].isaggr = 0;
-	connections[c].destlen = 0;
-	gettimeofday(&connections[c].lastwork, NULL);
-	connections[c].hadwork = 1;  /* force first iteration before stalling */
-	/* after this dispatchers will pick this connection up */
-	__sync_bool_compare_and_swap(&(connections[c].takenby), -2, 0);
-	__sync_add_and_fetch(&acceptedconnections, 1);
-
-	return c;
+	pthread_mutex_unlock(&register_listener_lock);
 }
 
-/**
- * Adds a connection which we know is from an aggregator, so direct
- * pipe.  This is different from normal connections that we don't want
- * to count them, never expire them, and want to recognise them when
- * we're doing reloads.
- */
-int
-dispatch_addconnection_aggr(int sock)
-{
-	int conn = dispatch_addconnection(sock);
-
-	if (conn == -1)
-		return 1;
-
-	connections[conn].noexpire = 1;
-	connections[conn].isaggr = 1;
-	acceptedconnections--;
-
-	return 0;
-}
 
 /**
  * Adds a pseudo-listener for datagram (UDP) sockets, which is pseudo,
@@ -310,299 +227,447 @@ dispatch_addconnection_aggr(int sock)
 int
 dispatch_addlistener_udp(int sock)
 {
-	int conn = dispatch_addconnection(sock);
-
-	if (conn == -1)
-		return 1;
-
-	connections[conn].noexpire = 1;
-	acceptedconnections--;
+	dispatch_addlistener(sock, 1);
 
 	return 0;
 }
 
+int
+dispatch_addlistener_tcp(int sock)
+{
+	return dispatch_addlistener(sock, 0);
+}
+
 
 inline static char
-dispatch_process_dests(connection *conn, dispatcher *self, struct timeval now)
+dispatch_process_dests(metric_block *metric, dispatcher *self, char *firstspace)
 {
 	int i;
 	char force;
+	struct timeval now;
 
-	if (conn->destlen > 0) {
-		if (conn->maxsenddelay == 0)
-			conn->maxsenddelay = ((rand() % 750) + 250) * 1000;
-		/* force after timeout */
-		force = timediff(conn->lastwork, now) > conn->maxsenddelay;
-		for (i = 0; i < conn->destlen; i++) {
+	gettimeofday(&now, NULL);
+
+	/* perform routing of this metric */
+	tracef("dispatcher %d, connfd %d, metric %s",
+			self->id, conn->sock, conn->metric);
+	__sync_add_and_fetch(&(self->blackholes),
+			router_route(self->rtr,
+			metric->dests, &metric->destlen, CONN_DESTS_SIZE,
+			metric->srcaddr,
+			metric->metric, firstspace));
+	tracef("dispatcher %d, connfd %d, destinations %zd\n",
+			self->id, conn->sock, conn->destlen);
+
+	if (metric->destlen > 0) {
+		force = 1;
+		for (i = 0; i < metric->destlen; i++) {
 			tracef("dispatcher %d, connfd %d, metric %s, queueing to %s:%d\n",
 					self->id, conn->sock, conn->dests[i].metric,
 					server_ip(conn->dests[i].dest),
 					server_port(conn->dests[i].dest));
-			if (server_send(conn->dests[i].dest, conn->dests[i].metric, force) == 0)
+			if (server_send(metric->dests[i].dest, metric->dests[i].metric, force) == 0)
 				break;
 		}
-		if (i != conn->destlen) {
-			conn->destlen -= i;
-			memmove(&conn->dests[0], &conn->dests[i],
-					(sizeof(destination) * conn->destlen));
+		if (i != metric->destlen) {
+			metric->destlen -= i;
+			memmove(&metric->dests[0], &metric->dests[i],
+					(sizeof(destination) * metric->destlen));
 			return 0;
 		} else {
 			/* finally "complete" this metric */
-			conn->destlen = 0;
-			conn->lastwork = now;
-			conn->hadwork = 1;
+			metric->destlen = 0;
 		}
 	}
 
 	return 1;
 }
 
-#define IDLE_DISCONNECT_TIME  (10 * 60 * 1000 * 1000)  /* 10 minutes */
-/**
- * Look at conn and see if works needs to be done.  If so, do it.  This
- * function operates on an (exclusive) lock on the connection it serves.
- * Schematically, what this function does is like this:
- *
- *   read (partial) data  <----
- *         |                   |
- *         v                   |
- *   split and clean metrics   |
- *         |                   |
- *         v                   |
- *   route metrics             | feedback loop
- *         |                   | (stall client)
- *         v                   |
- *   send 1st attempt          |
- *         \                   |
- *          v*                 | * this is optional, but if a server's
- *   retry send (<1s)  --------    queue is full, the client is stalled
- *      block reads
- */
-static int
-dispatch_connection(connection *conn, dispatcher *self, struct timeval start)
-{
-	char *p, *q, *firstspace, *lastnl;
-	int len;
+int
+dispatch_parsebuf(dispatcher *self, metric_block *mblock, struct timeval start) {
+	char *p, *q, *firstspace, res;
+	int metric_sent = 0;
 
-	/* first try to resume any work being blocked */
-	if (dispatch_process_dests(conn, self, start) == 0) {
-		__sync_bool_compare_and_swap(&(conn->takenby), self->id, 0);
-		return 0;
-	}
+	/* metrics look like this: metric_path value timestamp\n
+	 * due to various messups we need to sanitise the
+	 * metrics_path here, to ensure we can calculate the metric
+	 * name off the filesystem path (and actually retrieve it in
+	 * the web interface). */
+	q = mblock->metric;
+	firstspace = NULL;
 
-	/* don't poll (read) when the last time we ran nothing happened,
-	 * this is to avoid excessive CPU usage, issue #126 */
-	if (!conn->hadwork && timediff(conn->lastwork, start) < 100 * 1000) {
-		__sync_bool_compare_and_swap(&(conn->takenby), self->id, 0);
-		return 0;
-	}
-	conn->hadwork = 0;
+	for (p = mblock->buffer; *p; p++) {
+		if (*p == '\n' || *p == '\r') {
+			/* end of metric */
 
-	len = -2;
-	/* try to read more data, if that succeeds, or we still have data
-	 * left in the buffer, try to process the buffer */
-	if (
-			(!conn->needmore && conn->buflen > 0) ||
-			(len = read(conn->sock,
-						conn->buf + conn->buflen,
-						(sizeof(conn->buf) - 1) - conn->buflen)) > 0
-	   )
-	{
-		if (len > 0) {
-			conn->buflen += len;
-			tracef("dispatcher %d, connfd %d, read %d bytes from socket\n",
-					self->id, conn->sock, len);
-		}
-
-		/* metrics look like this: metric_path value timestamp\n
-		 * due to various messups we need to sanitise the
-		 * metrics_path here, to ensure we can calculate the metric
-		 * name off the filesystem path (and actually retrieve it in
-		 * the web interface). */
-		q = conn->metric;
-		firstspace = NULL;
-		lastnl = NULL;
-		for (p = conn->buf; p - conn->buf < conn->buflen; p++) {
-			if (*p == '\n' || *p == '\r') {
-				/* end of metric */
-				lastnl = p;
-
-				/* just a newline on it's own? some random garbage? skip */
-				if (q == conn->metric || firstspace == NULL) {
-					q = conn->metric;
-					firstspace = NULL;
-					continue;
-				}
-
-				__sync_add_and_fetch(&(self->metrics), 1);
-				*q++ = '\n';
-				*q = '\0';  /* can do this because we substract one from buf */
-
-				/* perform routing of this metric */
-				tracef("dispatcher %d, connfd %d, metric %s",
-						self->id, conn->sock, conn->metric);
-				__sync_add_and_fetch(&(self->blackholes),
-						router_route(self->rtr,
-						conn->dests, &conn->destlen, CONN_DESTS_SIZE,
-						conn->srcaddr,
-						conn->metric, firstspace));
-				tracef("dispatcher %d, connfd %d, destinations %zd\n",
-						self->id, conn->sock, conn->destlen);
-
-				/* restart building new one from the start */
-				q = conn->metric;
+			/* just a newline on it's own? some random garbage? skip */
+			if (q == mblock->metric || firstspace == NULL) {
+				q = mblock->metric;
 				firstspace = NULL;
+				continue;
+			}
 
-				conn->hadwork = 1;
-				gettimeofday(&conn->lastwork, NULL);
-				conn->maxsenddelay = 0;
-				/* send the metric to where it is supposed to go */
-				if (dispatch_process_dests(conn, self, conn->lastwork) == 0)
-					break;
-			} else if (*p == ' ' || *p == '\t' || *p == '.') {
-				/* separator */
-				if (q == conn->metric) {
-					/* make sure we skip this on next iteration to
-					 * avoid an infinite loop, issues #8 and #51 */
-					lastnl = p;
-					continue;
-				}
-				if (*p == '\t')
-					*p = ' ';
-				if (*p == ' ' && firstspace == NULL) {
-					if (*(q - 1) == '.')
-						q--;  /* strip trailing separator */
-					firstspace = q;
-					*q++ = ' ';
-				} else {
-					/* metric_path separator or space,
-					 * - duplicate elimination
-					 * - don't start with separator/space */
-					if (*(q - 1) != *p && (q - 1) != firstspace)
-						*q++ = *p;
-				}
-			} else if (firstspace != NULL ||
-					(*p >= 'a' && *p <= 'z') ||
-					(*p >= 'A' && *p <= 'Z') ||
-					(*p >= '0' && *p <= '9') ||
-					strchr(self->allowed_chars, *p))
-			{
-				/* copy char */
-				*q++ = *p;
+			__sync_add_and_fetch(&(self->metrics), 1);
+			*q++ = '\n';
+			*q = '\0';  /* can do this because we substract one from buf */
+
+			/* send the metric to where it is supposed to go */
+			metric_sent++;
+			res = dispatch_process_dests(mblock, self, firstspace);
+
+			/* restart building new one from the start */
+			q = mblock->metric;
+			firstspace = NULL;
+
+			if (res == 0)
+				break;
+		} else if (*p == ' ' || *p == '\t' || *p == '.') {
+			/* separator */
+			if (q == mblock->metric) {
+				/* make sure we skip this on next iteration to
+				 * avoid an infinite loop, issues #8 and #51 */
+				continue;
+			}
+			if (*p == '\t')
+				*p = ' ';
+			if (*p == ' ' && firstspace == NULL) {
+				if (*(q - 1) == '.')
+					q--;  /* strip trailing separator */
+				firstspace = q;
+				*q++ = ' ';
 			} else {
-				/* something barf, replace by underscore */
-				*q++ = '_';
+				/* metric_path separator or space,
+				 * - duplicate elimination
+				 * - don't start with separator/space */
+				if (*(q - 1) != *p && (q - 1) != firstspace)
+					*q++ = *p;
+			}
+		} else if (firstspace != NULL ||
+				(*p >= 'a' && *p <= 'z') ||
+				(*p >= 'A' && *p <= 'Z') ||
+				(*p >= '0' && *p <= '9') ||
+				strchr(self->allowed_chars, *p))
+		{
+			/* copy char */
+			*q++ = *p;
+		} else {
+			/* something barf, replace by underscore */
+			*q++ = '_';
+		}
+	}
+	
+	return metric_sent;
+}
+
+/**
+ * This function will be called by libevent when the client socket is
+ * ready for reading.
+ */
+void
+dispatch_connread_cb(int fd, short ev, void *arg)
+{
+	connection *conn = (connection *)arg;
+	char *lastnl;
+	int len, buf_len;
+	metric_block *mblock;
+	dispatcher *disp;
+	struct timeval start, stop;
+
+	gettimeofday(&start, NULL);
+
+	if (__sync_bool_compare_and_swap(&(conn->self->keep_running), 1, 1)) {
+		len = read(fd,
+					conn->buf + conn->buflen,
+					(sizeof(conn->buf) - 1) - conn->buflen);
+
+		if (len > 0) {
+			/* try to read more data, if that succeeds, or we still have data
+			 * left in the buffer, try to process the buffer */
+			conn->buflen += len;
+			tracef("dispatcher 0, connfd %d, read %d bytes from socket\n",
+					conn->sock, len);
+
+			// search last newline
+			lastnl = (char *) memrchr(conn->buf, '\n', conn->buflen);
+
+			if (lastnl != NULL) {
+				/* copy the buffer to new metric block
+				 * alloc struct + buffer */
+				buf_len = lastnl - conn->buf + 1;
+				if (buf_len > 1) {
+					mblock = malloc(sizeof(metric_block) + buf_len);
+					if (mblock) {
+						mblock->buf_len = buf_len;
+						mblock->buffer = &(mblock->_buf);
+						memcpy(mblock->buffer, conn->buf, mblock->buf_len);
+						mblock->buffer[mblock->buf_len] = 0;
+						strcpy(mblock->srcaddr, conn->srcaddr);
+
+						disp = workers[++idx % workercnt + 1];
+						pthread_mutex_lock(&disp->conn_queue_lock);
+						TAILQ_INSERT_TAIL(&disp->metric_block_head, mblock, entries);
+						pthread_cond_signal(&disp->conn_queue_cond);
+						pthread_mutex_unlock(&disp->conn_queue_lock);
+					}
+				}
+
+				/* move remaining stuff to the front */
+				conn->buflen -= buf_len;
+				memmove(conn->buf, lastnl + 1, conn->buflen);
+			}
+			/* prevent overflow of buffer with junk */
+			else if (conn->buflen > METRIC_MAXLEN) {
+				conn->buflen -= METRIC_MAXLEN;
+				memmove(conn->buf, conn->buf + METRIC_MAXLEN + 1, conn->buflen);
 			}
 		}
-		conn->needmore = q != conn->metric;
-		if (lastnl != NULL) {
-			/* move remaining stuff to the front */
-			conn->buflen -= lastnl + 1 - conn->buf;
-			memmove(conn->buf, lastnl + 1, conn->buflen);
-		}
-	}
-	if (len == -1 && (errno == EINTR ||
-				errno == EAGAIN ||
-				errno == EWOULDBLOCK))
-	{
-		/* nothing available/no work done */
-		struct timeval stop;
+
 		gettimeofday(&stop, NULL);
-		if (!conn->noexpire &&
-				timediff(conn->lastwork, stop) > IDLE_DISCONNECT_TIME)
+		__sync_add_and_fetch(&(conn->self->ticks), timediff(start, stop));
+
+		if (len == -1 && (errno == EINTR ||
+					errno == EAGAIN ||
+					errno == EWOULDBLOCK))
 		{
-			/* force close connection below */
-			len = 0;
-		} else {
-			__sync_bool_compare_and_swap(&(conn->takenby), self->id, 0);
-			return 0;
+			/* nothing available/no work done */
+			if (!conn->noexpire)
+			{
+				/* force close connection below */
+				len = 0;
+			} else {
+				return;
+			}
+		}
+
+		if (len == -1 || len == 0) {  /* error + EOF */
+			/* we also disconnect the client in this case if our reading
+			 * buffer is full, but we still need more (read returns 0 if the
+			 * size argument is 0) -> this is good, because we can't do much
+			 * with such client */
+
+#if 0
+			if (len == 0) {
+				/* Client disconnected */
+				printf("Client disconnected. Sent %d\n", conn->metric_sent);
+			}
+			else if (len < 0) {
+				/* Some other error occurred */
+				printf("Socket failure, disconnecting client: %s",
+					strerror(errno));
+			}
+#endif
+			if (conn->noexpire) {
+				/* reset buffer only (UDP) and move on */
+				conn->buflen = 0;
+			}
+			else {
+				/* close the socket, remove
+				 * the event and free the client structure. */
+				close(conn->sock);
+				__sync_add_and_fetch(&closedconnections, 1);
+				event_del(&conn->ev_read);
+				free(conn);
+			}
 		}
 	}
-	if (len == -1 || len == 0) {  /* error + EOF */
-		/* we also disconnect the client in this case if our reading
-		 * buffer is full, but we still need more (read returns 0 if the
-		 * size argument is 0) -> this is good, because we can't do much
-		 * with such client */
-
-		if (conn->noexpire) {
-			/* reset buffer only (UDP) and move on */
-			conn->needmore = 1;
-			conn->buflen = 0;
-			__sync_bool_compare_and_swap(&(conn->takenby), self->id, 0);
-
-			return 0;
-		} else {
-			__sync_add_and_fetch(&closedconnections, 1);
-			close(conn->sock);
-
-			/* flag this connection as no longer in use */
-			__sync_bool_compare_and_swap(&(conn->takenby), self->id, -1);
-
-			return 0;
-		}
-	}
-
-	/* "release" this connection again */
-	__sync_bool_compare_and_swap(&(conn->takenby), self->id, 0);
-
-	return 1;
 }
 
 /**
- * pthread compatible routine that handles connections and processes
- * whatever comes in on those.
+ * This function will be called by libevent when there is a connection
+ * ready to be accepted.
  */
+void
+dispatch_accept_cb(int fd, short ev, dispatcher *self, int is_udp)
+{
+	int client_fd;
+	struct sockaddr_in6 client_addr;
+	socklen_t client_len = sizeof(client_addr);
+	connection *client;
+	struct timeval start, stop;
+
+	gettimeofday(&start, NULL);
+	if (is_udp) {
+		client_fd = fd;
+	}
+	else {
+		/* Accept the new connection. */
+		client_fd = accept(fd, (struct sockaddr *)&client_addr, &client_len);
+		if (client_fd == -1) {
+			logerr("accept failed");
+			gettimeofday(&stop, NULL);
+			__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
+			return;
+		}
+
+		/* Set the client socket to non-blocking mode. */
+		(void) fcntl(client_fd, F_SETFL, O_NONBLOCK);
+
+		if (sockbufsize > 0) {
+			if (setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF,
+					&sockbufsize, sizeof(sockbufsize)) != 0)
+				;
+		}
+	}
+
+	__sync_add_and_fetch(&acceptedconnections, 1);
+
+	/* We've accepted a new client, allocate a client object to
+	 * maintain the state of this client. */
+	// start work
+	
+	client = calloc(1, sizeof(connection));
+	if (client == NULL)
+		logerr("malloc failed");
+
+	client->sock = client_fd;
+	client->buflen = 0;
+	client->self = self;
+	client->noexpire = is_udp;
+
+	/* figure out who's calling */
+	if (getpeername(client_fd, (struct sockaddr *)&client_addr, &client_len) == 0) {
+		snprintf(client->srcaddr, sizeof(client->srcaddr),
+				"(unknown)");
+		switch (client_addr.sin6_family) {
+			case PF_INET:
+				inet_ntop(client_addr.sin6_family,
+						&((struct sockaddr_in *)&client_addr)->sin_addr,
+						client->srcaddr, sizeof(client->srcaddr));
+				break;
+			case PF_INET6:
+				inet_ntop(client_addr.sin6_family, &client_addr.sin6_addr,
+						client->srcaddr, sizeof(client->srcaddr));
+				break;
+		}
+	}
+	else {
+		snprintf(client->srcaddr, sizeof(client->srcaddr),
+				"(internal)");
+	}
+
+	/* Setup the read event, libevent will call dispatch_connread_cb() whenever
+	 * the clients socket becomes read ready.  We also make the
+	 * read event persistent so we don't have to re-add after each
+	 * read. */
+	event_set(&client->ev_read, client_fd, EV_READ|EV_PERSIST, dispatch_connread_cb, 
+	    client);
+
+	/* Setting up the event does not activate, add the event so it
+	 * becomes active. */
+	event_add(&client->ev_read, NULL);
+
+	gettimeofday(&stop, NULL);
+	__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
+}
+
+void
+dispatch_accept_cb_exp(int fd, short ev, void *arg) {
+	dispatcher *self = (dispatcher *)arg;
+	return dispatch_accept_cb(fd, ev, self, 0);
+}
+
+void
+dispatch_accept_cb_noexp(int fd, short ev, void *arg) {
+	dispatcher *self = (dispatcher *)arg;
+	return dispatch_accept_cb(fd, ev, self, 1);
+}
+
+static void dispatch_timer_cb (int fd, short flags, void *arg) {
+	dispatcher *self = (dispatcher *)arg;
+	listener *list;
+
+	/* check if we have to leave event loop */
+	if (__sync_bool_compare_and_swap(&(self->keep_running), 1, 1)) {
+		struct timeval tv, start, stop;
+		gettimeofday(&start, NULL);
+
+		/* register/deregister listeners in libevent
+		 * in same thread because of threading issues in libevent 1.x
+		 */
+		pthread_mutex_lock(&register_listener_lock);
+		TAILQ_FOREACH(list, &register_listener_head, entries) {
+			if (PLAN_CLOSED == list->state) {
+				event_del(&(list->ev_read));
+				list->state = CLOSED;
+			}
+			else if (PLAN_ACTIVE == list->state) {
+				event_set(&(list->ev_read), list->sock, EV_READ|EV_PERSIST,
+					(list->noclose) ? dispatch_accept_cb_noexp : dispatch_accept_cb_exp, self);
+				event_add(&(list->ev_read), NULL);
+				list->state = ACTIVE;
+			}
+		}
+		pthread_mutex_unlock(&register_listener_lock);
+
+		/* and reinsert timer event */
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		evtimer_add(&self->timer_ev, &tv);
+
+		gettimeofday(&stop, NULL);
+		__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
+	}
+	else {
+		/* shutdown event loop
+		 * cleanup listener queue */
+		pthread_mutex_lock(&register_listener_lock);
+		while ((list = TAILQ_FIRST(&register_listener_head))) {
+			TAILQ_REMOVE(&register_listener_head, list, entries);
+			if (PLAN_CLOSED == list->state || ACTIVE == list->state) {
+				event_del(&(list->ev_read));
+				list->state = CLOSED;
+				if (ACTIVE == list->state)
+					close(list->sock);
+			}
+			free(list);
+		}
+		pthread_mutex_unlock(&register_listener_lock);
+
+		event_base_loopexit(ev_base, NULL);
+	}
+}
+
 static void *
 dispatch_runner(void *arg)
 {
 	dispatcher *self = (dispatcher *)arg;
-	connection *conn;
-	int c;
+
+	self->metrics = 0;
+	self->blackholes = 0;
+	self->ticks = 0;
+	self->sleeps = 0;
+	self->prevmetrics = 0;
+	self->prevblackholes = 0;
+	self->prevticks = 0;
+	self->prevsleeps = 0;
+
+	pthread_mutex_init(&self->conn_queue_lock, NULL);
+	pthread_cond_init(&self->conn_queue_cond, NULL);
 
 	if (self->type == LISTENER) {
-		struct pollfd ufds[MAX_LISTENERS];
-		int fds;
-		while (__sync_bool_compare_and_swap(&(self->keep_running), 1, 1)) {
-			pthread_rwlock_rdlock(&listenerslock);
-			fds = 0;
-			for (c = 0; c < MAX_LISTENERS; c++) {
-				if (listeners[c] == NULL)
-					continue;
-				ufds[fds].fd = listeners[c]->sock;
-				ufds[fds].events = POLLIN;
-				fds++;
-			}
-			pthread_rwlock_unlock(&listenerslock);
-			if (poll(ufds, fds, 1000) > 0) {
-				for (c = fds - 1; c >= 0; c--) {
-					if (ufds[c].revents & POLLIN) {
-						int client;
-						struct sockaddr addr;
-						socklen_t addrlen = sizeof(addr);
+		struct timeval tv;
 
-						if ((client = accept(ufds[c].fd, &addr, &addrlen)) < 0)
-						{
-							logerr("dispatch: failed to "
-									"accept() new connection: %s\n",
-									strerror(errno));
-							dispatch_check_rlimit_and_warn();
-							continue;
-						}
-						if (dispatch_addconnection(client) == -1) {
-							close(client);
-							continue;
-						}
-					}
-				}
-			}
-		}
+		/* Initialize libevent. */
+		ev_base = event_init();
+
+		/* set up timer. */
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		evtimer_set(&self->timer_ev, dispatch_timer_cb, self);
+		evtimer_add(&self->timer_ev, &tv);
+
+		/* Start the libevent event loop. */
+		event_base_dispatch(ev_base);
+
+		event_base_free(ev_base);
+
 	} else if (self->type == CONNECTION) {
-		int work;
 		struct timeval start, stop;
+		metric_block *mblock;
 
+		TAILQ_INIT(&self->metric_block_head);
+		
 		while (__sync_bool_compare_and_swap(&(self->keep_running), 1, 1)) {
-			work = 0;
-
 			if (__sync_bool_compare_and_swap(&(self->route_refresh_pending), 1, 1)) {
 				self->rtr = self->pending_rtr;
 				self->pending_rtr = NULL;
@@ -610,35 +675,26 @@ dispatch_runner(void *arg)
 				self->hold = 0;
 			}
 
+			pthread_mutex_lock(&self->conn_queue_lock);
 			gettimeofday(&start, NULL);
-			pthread_rwlock_rdlock(&connectionslock);
-			for (c = 0; c < connectionslen; c++) {
-				conn = &(connections[c]);
-				/* atomically try to "claim" this connection */
-				if (!__sync_bool_compare_and_swap(
-							&(conn->takenby), 0, self->id))
-					continue;
-				if (self->hold && !conn->isaggr) {
-					__sync_bool_compare_and_swap(
-							&(conn->takenby), self->id, 0);
-					continue;
-				}
-				work += dispatch_connection(conn, self, start);
-			}
-			pthread_rwlock_unlock(&connectionslock);
-			gettimeofday(&stop, NULL);
-			__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
-
-			/* nothing done, avoid spinlocking */
-			if (__sync_bool_compare_and_swap(&(self->keep_running), 1, 1) &&
-					work == 0)
-			{
-				gettimeofday(&start, NULL);
-				usleep((100 + (rand() % 200)) * 1000);  /* 100ms - 300ms */
+			if (!(mblock = TAILQ_FIRST(&self->metric_block_head))) {
+				/* nothing to do, wait */
+				pthread_cond_wait(&self->conn_queue_cond, &self->conn_queue_lock);
+				pthread_mutex_unlock(&self->conn_queue_lock);
 				gettimeofday(&stop, NULL);
 				__sync_add_and_fetch(&(self->sleeps), timediff(start, stop));
 			}
+			else {
+				/* got data */
+				TAILQ_REMOVE(&self->metric_block_head, mblock, entries);
+				pthread_mutex_unlock(&self->conn_queue_lock);
+				dispatch_parsebuf(self, mblock, start);
+				free(mblock);
+				gettimeofday(&stop, NULL);
+				__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
+			}
 		}
+
 	} else {
 		logerr("huh? unknown self type!\n");
 	}
@@ -683,12 +739,6 @@ dispatch_new(char id, enum conntype type, router *r, char *allowed_chars)
 	return ret;
 }
 
-void
-dispatch_set_bufsize(unsigned int nsockbufsize)
-{
-	sockbufsize = nsockbufsize;
-}
-
 static char globalid = 0;
 
 /**
@@ -696,9 +746,10 @@ static char globalid = 0;
  * (and putting them on the queue for handling the connections).
  */
 dispatcher *
-dispatch_new_listener(void)
+dispatch_new_listener(unsigned int nsockbufsize)
 {
 	char id = globalid++;
+	sockbufsize = nsockbufsize;
 	return dispatch_new(id, LISTENER, NULL, NULL);
 }
 
@@ -729,6 +780,9 @@ void
 dispatch_shutdown(dispatcher *d)
 {
 	dispatch_stop(d);
+	pthread_mutex_lock(&d->conn_queue_lock);
+	pthread_cond_signal(&d->conn_queue_cond);
+	pthread_mutex_unlock(&d->conn_queue_lock);
 	pthread_join(d->tid, NULL);
 }
 
@@ -739,6 +793,8 @@ dispatch_shutdown(dispatcher *d)
 void
 dispatch_free(dispatcher *d)
 {
+	pthread_cond_destroy(&d->conn_queue_cond);
+	pthread_mutex_destroy(&d->conn_queue_lock);
 	free(d);
 }
 

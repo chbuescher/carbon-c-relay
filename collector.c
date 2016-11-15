@@ -146,22 +146,27 @@ collector_runner(void *s)
 		totmetrics = 0;
 		totblackholes = 0;
 		totsleeps = 0;
-		for (i = 0; dispatchers[i] != NULL; i++) {
+
+		snprintf(m, sizem, "listener_wallTime_us %zu %zu\n",
+				d_ticks(dispatchers[0]), (size_t)now);
+		send(metric);
+
+		for (i = 1; dispatchers[i] != NULL; i++) {
 			totsleeps += sleeps = d_sleeps(dispatchers[i]);
 			totticks += ticks = d_ticks(dispatchers[i]);
 			totmetrics += metrics = d_metrics(dispatchers[i]);
 			totblackholes += blackholes = d_blackholes(dispatchers[i]);
 			snprintf(m, sizem, "dispatcher%d.metricsReceived %zu %zu\n",
-					i + 1, metrics, (size_t)now);
+					i, metrics, (size_t)now);
 			send(metric);
 			snprintf(m, sizem, "dispatcher%d.metricsBlackholed %zu %zu\n",
-					i + 1, blackholes, (size_t)now);
+					i, blackholes, (size_t)now);
 			send(metric);
 			snprintf(m, sizem, "dispatcher%d.wallTime_us %zu %zu\n",
-					i + 1, ticks, (size_t)now);
+					i, ticks, (size_t)now);
 			send(metric);
 			snprintf(m, sizem, "dispatcher%d.sleepTime_us %zu %zu\n",
-					i + 1, sleeps, (size_t)now);
+					i, sleeps, (size_t)now);
 			send(metric);
 		}
 		snprintf(m, sizem, "metricsReceived %zu %zu\n",
