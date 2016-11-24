@@ -52,6 +52,13 @@ enum listentype {
 	CLOSED
 };
 
+enum chartype {
+	IS_TEXT,
+	IS_SEP,
+	IS_END,
+	IS_OTHER
+};
+
 typedef struct _connection {
 	int sock;
 	char srcaddr[24];  /* string representation of source address */
@@ -114,6 +121,9 @@ static unsigned int idx = 0;
 static TAILQ_HEAD(, _listener) register_listener_head;
 static pthread_mutex_t register_listener_lock;
 static struct event_base *ev_base;
+
+static char ctype_isinit = 0;
+static enum chartype ctype[256];
 
 extern dispatcher **workers;
 extern char workercnt;
@@ -283,10 +293,35 @@ dispatch_process_dests(metric_block *metric, dispatcher *self, char *firstspace)
 	return 1;
 }
 
+void
+dispatch_initctype(char *allowed_chars) {
+	unsigned short int i;
+	
+	for (i = 0; i < 256; i++) {
+		if (i == '\n' || i == '\r') {
+			ctype[i] = IS_END;
+		} else if (i == ' ' || i == '\t' || i == '.') {
+			ctype[i] = IS_SEP;
+		} else if ((i >= 'a' && i <= 'z') ||
+				(i >= 'A' && i <= 'Z') ||
+				(i >= '0' && i <= '9') ||
+				strchr(allowed_chars, i))
+		{
+			ctype[i] = IS_TEXT;
+		}
+		else {
+			ctype[i] = IS_OTHER;
+		}
+	}
+
+	ctype_isinit = 1;
+}
+
 int
 dispatch_parsebuf(dispatcher *self, metric_block *mblock, struct timeval start) {
 	char *p, *q, *firstspace, res;
 	int metric_sent = 0;
+	enum chartype ct;
 
 	/* metrics look like this: metric_path value timestamp\n
 	 * due to various messups we need to sanitise the
@@ -297,7 +332,32 @@ dispatch_parsebuf(dispatcher *self, metric_block *mblock, struct timeval start) 
 	firstspace = NULL;
 
 	for (p = mblock->buffer; *p; p++) {
-		if (*p == '\n' || *p == '\r') {
+		ct = ctype[(unsigned char) *p];
+		if (ct == IS_TEXT) {
+			/* copy char */
+			*q++ = *p;
+		} else if (ct == IS_SEP) {
+			/* separator */
+			if (q == mblock->metric) {
+				/* make sure we skip this on next iteration to
+				 * avoid an infinite loop, issues #8 and #51 */
+				continue;
+			}
+			if (*p == '\t')
+				*p = ' ';
+			if (*p == ' ' && firstspace == NULL) {
+				if (*(q - 1) == '.')
+					q--;  /* strip trailing separator */
+				firstspace = q;
+				*q++ = ' ';
+			} else {
+				/* metric_path separator or space,
+				 * - duplicate elimination
+				 * - don't start with separator/space */
+				if (*(q - 1) != *p && (q - 1) != firstspace)
+					*q++ = *p;
+			}
+		} else if (ct == IS_END) {
 			/* end of metric */
 
 			/* just a newline on it's own? some random garbage? skip */
@@ -321,32 +381,7 @@ dispatch_parsebuf(dispatcher *self, metric_block *mblock, struct timeval start) 
 
 			if (res == 0)
 				break;
-		} else if (*p == ' ' || *p == '\t' || *p == '.') {
-			/* separator */
-			if (q == mblock->metric) {
-				/* make sure we skip this on next iteration to
-				 * avoid an infinite loop, issues #8 and #51 */
-				continue;
-			}
-			if (*p == '\t')
-				*p = ' ';
-			if (*p == ' ' && firstspace == NULL) {
-				if (*(q - 1) == '.')
-					q--;  /* strip trailing separator */
-				firstspace = q;
-				*q++ = ' ';
-			} else {
-				/* metric_path separator or space,
-				 * - duplicate elimination
-				 * - don't start with separator/space */
-				if (*(q - 1) != *p && (q - 1) != firstspace)
-					*q++ = *p;
-			}
-		} else if (firstspace != NULL ||
-				(*p >= 'a' && *p <= 'z') ||
-				(*p >= 'A' && *p <= 'Z') ||
-				(*p >= '0' && *p <= '9') ||
-				strchr(self->allowed_chars, *p))
+		} else if (firstspace != NULL)
 		{
 			/* copy char */
 			*q++ = *p;
@@ -761,6 +796,8 @@ dispatcher *
 dispatch_new_connection(router *r, char *allowed_chars)
 {
 	char id = globalid++;
+	if (! ctype_isinit)
+		dispatch_initctype(allowed_chars);
 	return dispatch_new(id, CONNECTION, r, allowed_chars);
 }
 
