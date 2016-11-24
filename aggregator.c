@@ -21,7 +21,6 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
-#include <regex.h>
 #include <pthread.h>
 #include <errno.h>
 #include <assert.h>
@@ -174,7 +173,7 @@ aggregator_putmetric(
 		const char *metric,
 		const char *firstspace,
 		size_t nmatch,
-		regmatch_t *pmatch)
+		int *pmatch)
 {
 	char *v;
 	double val;

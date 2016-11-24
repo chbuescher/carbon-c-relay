@@ -18,7 +18,6 @@
 #ifndef AGGREGATOR_H
 #define AGGREGATOR_H 1
 
-#include <regex.h>
 #include <pthread.h>
 
 #include "server.h"
@@ -66,7 +65,7 @@ typedef struct _aggregator {
 aggregator *aggregator_new(unsigned int interval, unsigned int expire, enum _aggr_timestamp tswhen);
 char aggregator_add_compute(aggregator *s, const char *metric, const char *type);
 void aggregator_set_stub(aggregator *s, const char *stubname);
-void aggregator_putmetric(aggregator *s, const char *metric, const char *firstspace, size_t nmatch, regmatch_t *pmatch);
+void aggregator_putmetric(aggregator *s, const char *metric, const char *firstspace, size_t nmatch, int *pmatch);
 int aggregator_start(aggregator *aggrs);
 void aggregator_stop(void);
 size_t aggregator_numaggregators(aggregator *agrs);
