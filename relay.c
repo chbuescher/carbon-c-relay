@@ -679,6 +679,8 @@ main(int argc, char * const argv[])
 	fprintf(relay_stdout, "    routes configuration = %s\n", config);
 	fprintf(relay_stdout, "\n");
 
+	dispatch_initlisteners();
+
 	if ((rtr = router_readconfig(NULL, config,
 					queuesize, batchsize, maxstalls,
 					iotimeout, sockbufsize)) == NULL)
@@ -744,8 +746,6 @@ main(int argc, char * const argv[])
 		logerr("failed to allocate memory for workers\n");
 		return 1;
 	}
-
-	dispatch_initlisteners();
 
 	if ((workers[0] = dispatch_new_listener(sockbufsize)) == NULL)
 		logerr("failed to add listener\n");
