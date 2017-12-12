@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2016 Fabian Groffen
+ * Copyright 2013-2017 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <glob.h>
 #include <pcre.h>
 #include <sys/stat.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -396,6 +397,21 @@ determine_if_regex(route *r, char *pat, int flags)
 	return 0;
 }
 
+static char serverip_server[256];  /* RFC1035 = 250 */
+static const char *
+serverip(server *s)
+{
+	const char *srvr = server_ip(s);
+
+	if (strchr(srvr, ':') != NULL) {
+		snprintf(serverip_server, sizeof(serverip_server), "[%s]", srvr);
+		return serverip_server;
+	}
+
+	return srvr;
+}
+
+
 /**
  * Populates the routing tables by reading the config file.
  */
@@ -412,13 +428,13 @@ router_readconfig(router *orig,
 	char *buf;
 	size_t len = 0;
 	char *p;
-	cluster *cl;
 	struct stat st;
-	route *r = NULL;
-	aggregator *a = NULL;
 	struct addrinfo *saddrs;
 	char matchcatchallfound = 0;
 	router *ret = NULL;
+	cluster *cl = NULL;
+	aggregator *a = NULL;
+	route *r = NULL;
 
 	/* if there is no config, don't try anything */
 	if (stat(path, &st) == -1) {
@@ -565,22 +581,24 @@ router_readconfig(router *orig,
 			} else if (strncmp(p, "forward", 7) == 0 && isspace(*(p + 7))) {
 				p += 8;
 
+				/* allow useall keyword */
+				useall = 2;
+
 				cl->type = FORWARD;
 				cl->members.forward = NULL;
 			} else if (strncmp(p, "any_of", 6) == 0 && isspace(*(p + 6))) {
 				p += 7;
 
-				for (; *p != '\0' && isspace(*p); p++)
-					;
-				if (strncmp(p, "useall", 6) == 0 && isspace(*(p + 6))) {
-					p += 7;
-					useall = 1;
-				}
+				/* allow useall keyword */
+				useall = 2;
 
 				cl->type = ANYOF;
 				cl->members.anyof = NULL;
 			} else if (strncmp(p, "failover", 8) == 0 && isspace(*(p + 8))) {
 				p += 9;
+
+				/* allow useall keyword */
+				useall = 2;
 
 				cl->type = FAILOVER;
 				cl->members.anyof = NULL;
@@ -609,6 +627,18 @@ router_readconfig(router *orig,
 				return NULL;
 			}
 
+			/* parse optional useall */
+			if (useall == 2) {
+				useall = 0;
+
+				for (; *p != '\0' && isspace(*p); p++)
+					;
+				if (strncmp(p, "useall", 6) == 0 && isspace(*(p + 6))) {
+					p += 7;
+					useall = 1;
+				}
+			}
+
 			/* parse ips */
 			for (; *p != '\0' && isspace(*p); p++)
 				;
@@ -621,11 +651,11 @@ router_readconfig(router *orig,
 				char *proto = "tcp";
 				int port = 2003;
 				server *newserver = NULL;
-				struct addrinfo hint;
-				char sport[8];
 				int err;
 				struct addrinfo *walk = NULL;
-				struct addrinfo *next = NULL;
+				struct addrinfo hint;
+				char cannonicate;
+				char sport[8];
 				char hnbuf[256];
 
 				for (; *p != '\0' && !isspace(*p) && *p != ';'; p++) {
@@ -716,50 +746,50 @@ router_readconfig(router *orig,
 					}
 				}
 
-				if (cl->type != FILELOG && cl->type != FILELOGIP) {
-					/* resolve host/IP */
+				saddrs = NULL;
+				cannonicate = 0;
+				if (cl->type == FILELOG || cl->type == FILELOGIP) {
+					/* TODO: try to create/append to file */
+
+					proto = "file";
+				} else {
+					/* try to see if this is a "numeric" IP address, in
+					 * which case we take the cannonical representation so
+					 * as to ensure (string) comparisons will match lateron */
 					memset(&hint, 0, sizeof(hint));
 
 					hint.ai_family = PF_UNSPEC;
-					hint.ai_socktype = *proto == 'u' ? SOCK_DGRAM : SOCK_STREAM;
-					hint.ai_protocol = *proto == 'u' ? IPPROTO_UDP : IPPROTO_TCP;
-					hint.ai_flags = AI_NUMERICSERV;
-					snprintf(sport, sizeof(sport), "%u", port);  /* for default */
+					hint.ai_socktype =
+						*proto == 'u' ? SOCK_DGRAM : SOCK_STREAM;
+					hint.ai_protocol =
+						*proto == 'u' ? IPPROTO_UDP : IPPROTO_TCP;
+					hint.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+					snprintf(sport, sizeof(sport), "%u", port);
 
+					if ((err = getaddrinfo(ip, sport, &hint, &saddrs)) == 0)
+						cannonicate = 1;
+
+					/* now resolve this the normal way to check validity */
+					if (saddrs == NULL) {
+						hint.ai_flags = AI_NUMERICSERV;
 					if ((err = getaddrinfo(ip, sport, &hint, &saddrs)) != 0) {
-						logerr("failed to resolve server %s:%s (%s) "
-								"for cluster %s: %s\n",
+							logerr("failed to resolve server %s, port %s, "
+									"proto %s, for cluster %s: %s\n",
 								ip, sport, proto, name, gai_strerror(err));
 						router_free(ret);
 						return NULL;
 					}
-
-					if (!useall && saddrs->ai_next != NULL) {
-						/* take first result only */
-						freeaddrinfo(saddrs->ai_next);
-						saddrs->ai_next = NULL;
 					}
-				} else {
-					/* TODO: try to create/append to file */
-
-					proto = "file";
-					saddrs = (void *)1;
 				}
 
-				walk = saddrs;
-				while (walk != NULL) {
+				walk = saddrs;  /* NULL if file */
+				do {
 					servers *s;
 
-					/* disconnect from the rest to avoid double
-					 * frees by freeaddrinfo() in server_destroy() */
-					if (walk != (void *)1) {
-						next = walk->ai_next;
-						walk->ai_next = NULL;
-					}
-
-					if (useall) {
-						/* unfold whatever we resolved, for human
-						 * readability issues */
+					if (useall || cannonicate) {
+						/* serialise the IP address, to make the targets
+						 * explicit in case of useall, cannonical
+						 * representation otherwise */
 						if (walk->ai_family == AF_INET) {
 							if (inet_ntop(walk->ai_family,
 									&((struct sockaddr_in *)walk->ai_addr)->sin_addr,
@@ -768,15 +798,10 @@ router_readconfig(router *orig,
 						} else if (walk->ai_family == AF_INET6) {
 							if (inet_ntop(walk->ai_family,
 									&((struct sockaddr_in6 *)walk->ai_addr)->sin6_addr,
-									hnbuf + 1, sizeof(hnbuf) - 2) != NULL)
-							{
-								hnbuf[0] = '[';
-								/* space is reserved above */
-								strcat(hnbuf, "]");
+									hnbuf, sizeof(hnbuf)) != NULL)
 								ip = hnbuf;
 							}
 						}
-					}
 
 					newserver = NULL;
 					for (s = ret->srvrs; s != NULL; s = s->next) {
@@ -794,13 +819,13 @@ router_readconfig(router *orig,
 						newserver = server_new(ip, (unsigned short)port,
 								*proto == 'f' ? CON_FILE :
 								*proto == 'u' ? CON_UDP : CON_TCP,
-								walk == (void *)1 ? NULL : walk,
+								saddrs,
+								(cannonicate || *proto == 'f') ? NULL : &hint,
 								queuesize, batchsize, maxstalls,
 								iotimeout, sockbufsize);
 						if (newserver == NULL) {
 							logerr("failed to add server %s:%d (%s) "
-									"to cluster %s: %s\n", ip, port, proto,
-									name, strerror(errno));
+									"to cluster %s\n", ip, port, proto, name);
 							router_free(ret);
 							freeaddrinfo(saddrs);
 							return NULL;
@@ -843,7 +868,7 @@ router_readconfig(router *orig,
 								logerr("cannot set instance '%s' for "
 										"server %s:%d: server was previously "
 										"defined without instance\n",
-										inst, server_ip(newserver),
+										inst, serverip(newserver),
 										server_port(newserver));
 								router_free(ret);
 								freeaddrinfo(saddrs);
@@ -852,7 +877,7 @@ router_readconfig(router *orig,
 								logerr("cannot define server %s:%d without "
 										"instance: server was previously "
 										"defined with instance '%s'\n",
-										server_ip(newserver),
+										serverip(newserver),
 										server_port(newserver), sinst);
 								router_free(ret);
 								freeaddrinfo(saddrs);
@@ -863,7 +888,7 @@ router_readconfig(router *orig,
 								logerr("cannot set instance '%s' for "
 										"server %s:%d: server was previously "
 										"defined with instance '%s'\n",
-										inst, server_ip(newserver),
+										inst, serverip(newserver),
 										server_port(newserver), sinst);
 								router_free(ret);
 								freeaddrinfo(saddrs);
@@ -916,7 +941,7 @@ router_readconfig(router *orig,
 							if (s->refcnt > 1) {
 								logerr("cannot share server %s:%d with "
 										"any_of/failover cluster '%s'\n",
-										server_ip(newserver),
+										serverip(newserver),
 										server_port(newserver),
 										cl->name);
 								router_free(ret);
@@ -942,8 +967,8 @@ router_readconfig(router *orig,
 						}
 					}
 
-					walk = next;
-				}
+					walk = useall ? walk->ai_next : NULL;
+				} while (walk != NULL);
 
 				*p = termchr;
 				for (; *p != '\0' && isspace(*p); p++)
@@ -1054,6 +1079,7 @@ router_readconfig(router *orig,
 					router_free(ret);
 					return NULL;
 				}
+				d->next = NULL;
 				if ((d->cl = ra_malloc(ret, sizeof(cluster))) == NULL) {
 					logerr("malloc failed for validation rule in 'match %s'\n",
 							pat);
@@ -1100,18 +1126,21 @@ router_readconfig(router *orig,
 						return NULL;
 					}
 					rule->next = NULL;
+					rule->dests = NULL;
 					d->cl->members.validation->rule = rule;
 
 					err = determine_if_regex(rule, pat,
 							PCRE_NO_AUTO_CAPTURE);
 					if (err != 0) {
+						logerr("invalid expression '%s' for validate\n",
+								pat);
 						router_free(ret);
 						return NULL;
 					}
 				}
 
 				if (strncmp(p, "else", 4) != 0 || !isspace(*(p + 4))) {
-					logerr("expected 'else' after for validate %s\n", pat);
+					logerr("expected 'else' after validate %s\n", pat);
 					router_free(ret);
 					return NULL;
 				}
@@ -1202,6 +1231,7 @@ router_readconfig(router *orig,
 							w->type != STATSTUB &&
 							w->type != AGGREGATION &&
 							w->type != REWRITE &&
+							w->type != VALIDATION &&
 							strcmp(w->name, dest) == 0)
 						break;
 				}
@@ -1264,7 +1294,7 @@ router_readconfig(router *orig,
 
 			if (matchcatchallfound) {
 				logerr("warning: match %s will never be matched "
-						"due to preceding match * ... stop\n",
+						"due to preceeding match * ... stop\n",
 						r->pattern == NULL ? "*" : r->pattern);
 			}
 			if (r->matchtype == MATCHALL && r->stop)
@@ -1569,6 +1599,7 @@ router_readconfig(router *orig,
 								cw->type != STATSTUB &&
 								cw->type != AGGREGATION &&
 								cw->type != REWRITE &&
+								cw->type != VALIDATION &&
 								strcmp(cw->name, dest) == 0)
 							break;
 					}
@@ -1701,7 +1732,7 @@ router_readconfig(router *orig,
 
 			if (matchcatchallfound) {
 				logerr("warning: aggregate %s will never be matched "
-						"due to preceeding match * ... stop\n",
+						"due to preceding match * ... stop\n",
 						r->pattern);
 			}
 		} else if (strncmp(p, "rewrite", 7) == 0 && isspace(*(p + 7))) {
@@ -1799,7 +1830,7 @@ router_readconfig(router *orig,
 
 			if (matchcatchallfound) {
 				logerr("warning: rewrite %s will never be matched "
-						"due to preceeding match * ... stop\n",
+						"due to preceding match * ... stop\n",
 						r->pattern == NULL ? "*" : r->pattern);
 			}
 		} else if (strncmp(p, "send", 4) == 0 && isspace(*(p + 4))) {
@@ -1851,6 +1882,7 @@ router_readconfig(router *orig,
 							cw->type != STATSTUB &&
 							cw->type != AGGREGATION &&
 							cw->type != REWRITE &&
+							cw->type != VALIDATION &&
 							strcmp(cw->name, dest) == 0)
 						break;
 				}
@@ -2034,13 +2066,14 @@ router_readconfig(router *orig,
 			if (ret == NULL)
 				/* router_readconfig already barked and freed ret */
 				return NULL;
-			/* the included file could have added new aggregates, matches, or clusters,
-			 * so adjust these chains to point to the new end. */
-			for (; a != NULL && a->next != NULL; a = a->next)
+			/* the included file could have added new aggregates,
+			 * matches, or clusters, so adjust these chains to point to
+			 * the new end. */
+			for (a = ret->aggregators; a != NULL && a->next != NULL; a = a->next)
 				;
-			for (; cl->next != NULL; cl = cl->next)
+			for (cl = ret->clusters; cl->next != NULL; cl = cl->next)
 				;
-			for (; r != NULL && r->next != NULL; r = r->next)
+			for (r = ret->routes; r != NULL && r->next != NULL; r = r->next)
 				;
 			*p = endchar;
 			for (; *p != '\0' && isspace(*p); p++)
@@ -2086,7 +2119,7 @@ typedef struct _block {
  * specific and expensive matches to confirm fit.
  */
 void
-router_optimise(router *r)
+router_optimise(router *r, int threshold)
 {
 	char *p;
 	char pblock[64];
@@ -2101,12 +2134,14 @@ router_optimise(router *r)
 	size_t bsum;
 	size_t seq;
 
-	/* avoid optimising anything if it won't pay off */
+	/* avoid optimising anything if it won't pay off, note that threshold
+	 * can be negative, meaning it will never optimise */
 	seq = 0;
-	for (rwalk = r->routes; rwalk != NULL && seq < 50; rwalk = rwalk->next)
+	for (rwalk = r->routes; rwalk != NULL && seq < threshold; rwalk = rwalk->next)
 		seq++;
-	if (seq < 50)
+	if (seq < threshold)
 		return;
+	tracef("triggering optimiser, seq: %zd, threshold: %d\n", seq, threshold);
 
 	/* Heuristic: the last part of the matching regex is the most
 	 * discriminating part of the metric.  The last part is defined as a
@@ -2128,6 +2163,7 @@ router_optimise(router *r)
 	for (rwalk = r->routes; rwalk != NULL; rwalk = rnext) {
 		/* matchall and rewrite rules cannot be in a group (issue #218) */
 		if (rwalk->matchtype == MATCHALL || rwalk->dests->cl->type == REWRITE) {
+			tracef("skipping %s\n", rwalk->pattern ? rwalk->pattern : "*");
 			blast->next = malloc(sizeof(block));
 			blast->next->prev = blast;
 			blast = blast->next;
@@ -2173,6 +2209,7 @@ router_optimise(router *r)
 		}
 		if (p == rwalk->pattern) {
 			/* nothing we can do with a pattern like this */
+			tracef("skipping unusable %s\n", p);
 			blast->next = malloc(sizeof(block));
 			blast->next->prev = blast;
 			blast = blast->next;
@@ -2208,6 +2245,8 @@ router_optimise(router *r)
 		b = pblock;
 		if (strlen(b) < 3) {
 			/* this probably isn't selective enough, don't put in a group */
+			tracef("skipping too small pattern %s from %s\n",
+					b, rwalk->pattern);
 			blast->next = malloc(sizeof(block));
 			blast->next->prev = blast;
 			blast = blast->next;
@@ -2224,6 +2263,7 @@ router_optimise(router *r)
 			rlast = NULL;
 			continue;
 		}
+		tracef("found pattern %s from %s\n", b, rwalk->pattern);
 
 		/* at this point, b points to the tail block in reverse, see if
 		 * we already had such tail in place */
@@ -2233,6 +2273,7 @@ router_optimise(router *r)
 			break;
 		}
 		if (bwalk == NULL) {
+			tracef("creating new group %s for %s\n", b, rwalk->pattern);
 			blast->next = malloc(sizeof(block));
 			blast->next->prev = blast;
 			blast = blast->next;
@@ -2253,6 +2294,7 @@ router_optimise(router *r)
 			continue;
 		}
 
+		tracef("adding %s to existing group %s\n", rwalk->pattern, b);
 		bwalk->refcnt++;
 		bwalk->lastroute = bwalk->lastroute->next = rwalk;
 		rnext = rwalk->next;
@@ -2333,41 +2375,24 @@ router_optimise(router *r)
 server **
 router_getservers(router *r)
 {
-#define SERVSZ  511
-	server **ret = malloc(sizeof(server *) * SERVSZ + 1);
-	cluster *c;
+	server **ret;
 	servers *s;
 	int i;
 
-	*ret = NULL;
+	i = 0;
+	for (s = r->srvrs; s != NULL; s = s->next)
+		i++;
 
-#define add_server(X) { \
-	for (i = 0; i < SERVSZ && ret[i] != NULL; i++) \
-		if (ret[i] == X) \
-			break; \
-	if (i < SERVSZ && ret[i] == NULL) { \
-		ret[i] = X; \
-		ret[i + 1] = NULL; \
-	} \
-}
+	ret = malloc(sizeof(server *) * (i + 1));
+	if (ret == NULL)
+		return NULL;
 
-	for (c = r->clusters; c != NULL; c = c->next) {
-		if (c->type == FORWARD ||
-				c->type == FILELOG || c->type == FILELOGIP)
-		{
-			for (s = c->members.forward; s != NULL; s = s->next)
-				add_server(s->server);
-		} else if (c->type == ANYOF || c->type == FAILOVER) {
-			for (s = c->members.anyof->list; s != NULL; s = s->next)
-				add_server(s->server);
-		} else if (c->type == CARBON_CH ||
-				c->type == FNV1A_CH ||
-				c->type == JUMP_CH)
-		{
-			for (s = c->members.ch->servers; s != NULL; s = s->next)
-				add_server(s->server);
-		}
-	}
+	i = 0;
+	for (s = r->srvrs; s != NULL; s = s->next)
+		ret[i++] = s->server;
+
+	/* ensure NULL-termination */
+	ret[i] = NULL;
 
 	return ret;
 }
@@ -2417,17 +2442,17 @@ router_printconfig(router *rtr, FILE *f, char pmode)
 			fprintf(f, "    forward\n");
 			for (s = c->members.forward; s != NULL; s = s->next)
 				fprintf(f, "        %s:%d%s\n",
-						server_ip(s->server), server_port(s->server), PPROTO);
+						serverip(s->server), server_port(s->server), PPROTO);
 		} else if (c->type == FILELOG || c->type == FILELOGIP) {
 			fprintf(f, "    file%s\n", c->type == FILELOGIP ? " ip" : "");
 			for (s = c->members.forward; s != NULL; s = s->next)
 				fprintf(f, "        %s\n",
-						server_ip(s->server));
+						serverip(s->server));
 		} else if (c->type == ANYOF || c->type == FAILOVER) {
 			fprintf(f, "    %s\n", c->type == ANYOF ? "any_of" : "failover");
 			for (s = c->members.anyof->list; s != NULL; s = s->next)
 				fprintf(f, "        %s:%d%s\n",
-						server_ip(s->server), server_port(s->server), PPROTO);
+						serverip(s->server), server_port(s->server), PPROTO);
 		} else if (c->type == CARBON_CH ||
 				c->type == FNV1A_CH ||
 				c->type == JUMP_CH)
@@ -2438,7 +2463,7 @@ router_printconfig(router *rtr, FILE *f, char pmode)
 					c->members.ch->repl_factor);
 			for (s = c->members.ch->servers; s != NULL; s = s->next)
 				fprintf(f, "        %s:%d%s%s%s\n",
-						server_ip(s->server), server_port(s->server),
+						serverip(s->server), server_port(s->server),
 						server_instance(s->server) ? "=" : "",
 						server_instance(s->server) ? server_instance(s->server) : "",
 						PPROTO);
@@ -2537,12 +2562,13 @@ router_printconfig(router *rtr, FILE *f, char pmode)
 			fprintf(f, "# common pattern group '%s' "
 					"contains %zu aggregations/matches\n",
 					++b, cnt);
-			if (mode & PMODE_AGGR) {
-				router srtr;
-				memset(&srtr, 0, sizeof(srtr));
-				srtr.routes = r->dests->cl->members.routes;
-				/* recurse */
-				router_printconfig(&srtr, f, pmode);
+			if (pmode & PMODE_AGGR) {
+					router srtr;
+					memset(&srtr, 0, sizeof(srtr));
+					srtr.routes = r->dests->cl->members.routes;
+					/* recurse */
+					router_printconfig(&srtr, f, pmode);
+					fprintf(f, "# end of group '%s'\n", b);
 			}
 		} else if (r->dests->cl->type == AGGRSTUB ||
 				r->dests->cl->type == STATSTUB)
@@ -2705,7 +2731,7 @@ router_transplant_queues(router *new, router *old)
 
 	for (ns = new->srvrs; ns != NULL; ns = ns->next) {
 		for (os = old->srvrs; os != NULL; os = os->next) {
-			if (strcmp(server_ip(ns->server), server_ip(os->server)) &&
+			if (strcmp(server_ip(ns->server), server_ip(os->server)) == 0 &&
 					server_port(ns->server) == server_port(os->server) &&
 					server_ctype(ns->server) == server_ctype(os->server))
 			{
@@ -2729,7 +2755,7 @@ router_start(router *rtr)
 	for (s = rtr->srvrs; s != NULL; s = s->next) {
 		if ((err = server_start(s->server)) != 0) {
 			logerr("failed to start server %s:%u: %s\n",
-					server_ip(s->server),
+					serverip(s->server),
 					server_port(s->server),
 					strerror(err));
 			ret = 1;
@@ -2973,7 +2999,10 @@ router_route_intern(
 			 * having to calculate the end of the pattern string all the
 			 * time */
 			for (p = firstspace - 1; p >= metric; p--) {
-				for (q = w->dests->cl->name, t = p; *q != '\0' && t >= metric; q++, t--) {
+				for (q = w->dests->cl->name, t = p;
+						*q != '\0' && t >= metric;
+						q++, t--)
+				{
 					if (*q != *t)
 						break;
 				}
@@ -3156,12 +3185,12 @@ router_route_intern(
 					}	break;
 				}
 			}
+		}
 
 			/* stop processing further rules if requested */
 			if (stop)
 				break;
 		}
-	}
 	if (!wassent)
 		*blackholed = 1;
 
@@ -3374,7 +3403,18 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 						fprintf(stdout, "    forward(%s)\n", d->cl->name);
 						for (s = d->cl->members.forward; s != NULL; s = s->next)
 							fprintf(stdout, "        %s:%d\n",
-									server_ip(s->server), server_port(s->server));
+									serverip(s->server), server_port(s->server));
+					}	break;
+					case FILELOG:
+					case FILELOGIP: {
+						servers *s;
+
+						fprintf(stdout, "    file%s(%s)\n",
+								d->cl->type == FILELOGIP ? " ip" : "",
+								d->cl->name);
+						for (s = d->cl->members.forward; s != NULL; s = s->next)
+							fprintf(stdout, "        %s\n",
+									serverip(s->server));
 					}	break;
 					case CARBON_CH:
 					case FNV1A_CH:
@@ -3400,7 +3440,7 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 								firstspace);
 						for (i = 0; i < d->cl->members.ch->repl_factor; i++) {
 							fprintf(stdout, "        %s:%d\n",
-									server_ip(dst[i].dest),
+									serverip(dst[i].dest),
 									server_port(dst[i].dest));
 							free((char *)dst[i].metric);
 						}
@@ -3422,7 +3462,7 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 							hash = 0;
 						}
 						fprintf(stdout, "        %s:%d\n",
-								server_ip(d->cl->members.anyof->servers[hash]),
+								serverip(d->cl->members.anyof->servers[hash]),
 								server_port(d->cl->members.anyof->servers[hash]));
 					}	break;
 					case VALIDATION: {

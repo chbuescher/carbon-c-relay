@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2016 Fabian Groffen
+ * Copyright 2013-2017 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -298,7 +298,7 @@ dispatch_initctype(char *allowed_chars) {
 	unsigned short int i;
 	
 	for (i = 0; i < 256; i++) {
-		if (i == '\n' || i == '\r') {
+		if (i == '\n' || i == '\r' || i == 0) {
 			ctype[i] = IS_END;
 		} else if (i == ' ' || i == '\t' || i == '.') {
 			ctype[i] = IS_SEP;

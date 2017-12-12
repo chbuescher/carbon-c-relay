@@ -177,6 +177,12 @@ These options control the behaviour of **carbon-c-relay**.
     is in particular useful when daemonised in combination with init
     managers.
 
+  * `-O` *threshold*:
+    The minimum number of rules to find before trying to optimise the
+    ruleset.  The default is `50`, to disable the optimiser, use `-1`,
+    to always run the optimiser use `0`.  The optimiser tries to group
+    rules to avoid spending excessive time on matching expressions.
+
 ## CONFIGURATION SYNTAX
 
 The config file supports the following syntax, where comments start with
@@ -185,7 +191,7 @@ input until the end of that line:
 
 ```
 cluster <name>
-    <forward | any_of [useall] | failover |
+    < <forward | any_of | failover> [useall] |
     <carbon_ch | fnv1a_ch | jump_fnv1a_ch> [replication <count>]>
         <host[:port][=instance] [proto <udp | tcp>]> ...
     ;
@@ -197,7 +203,7 @@ cluster <name>
 
 match
         <* | expression ...>
-	[validate <expression> else <log | drop>]
+    [validate <expression> else <log | drop>]
     send to <cluster ... | blackhole>
     [stop]
     ;
@@ -283,9 +289,10 @@ practice to fix the order of the servers with instances such that it is
 explicit what the right nodes for the jump hash are.
 
 DNS hostnames are resolved to a single address, according to the preference
-rules in [RFC 3484](https://www.ietf.org/rfc/rfc3484.txt).  The `any_of`
-cluster has an explicit `useall` flag that enables a hostname to resolve to
-multiple addresses.  Each address returned becomes a cluster destination.
+rules in [RFC 3484](https://www.ietf.org/rfc/rfc3484.txt).  The
+`any_of`, `failover` and `forward` clusters have an explicit `useall`
+flag that enables expansion for hostnames resolving to multiple
+addresses.  Each address returned becomes a cluster destination.
 
 Match rules are the way to direct incoming metrics to one or more
 clusters.  Match rules are processed top to bottom as they are defined
@@ -308,7 +315,8 @@ metrics will be sent to destinations, this is the `drop` behaviour.
 When `log` is used, the metric is logged to stderr.  Care should be
 taken with the latter to avoid log flooding.  When a validate clause is
 present, destinations need not to be present, this allows for applying a
-global validation rule.
+global validation rule.  Note that the cleansing rules are applied
+before validation is done, thus the data will not have duplicate spaces.
 
 Rewrite rules take a regular input to match incoming metrics, and
 transform them into the desired new metric name.  In the replacement,

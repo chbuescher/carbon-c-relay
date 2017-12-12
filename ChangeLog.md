@@ -1,4 +1,39 @@
-# 2.4 (unreleased master branch)
+# 2.7 (unreleased master branch)
+
+
+# 2.6 (2017-01-26)
+
+### New Features
+
+* **router** `useall` is now also allowed for `forward` and `failover`
+             clusters
+* **server** hostnames are now re-resolved at every connect
+             [Issue #115](https://github.com/grobian/carbon-c-relay/issues/115)
+* **server** when connecting to a hostname, now /all/ resolved addresses
+             are tried in order before failing
+* **relay** A new `-O` flag allows to set the minimum rules threshold
+            before trying to optimise the rules.
+
+### Bugfixes
+
+* [Issue #246](https://github.com/grobian/carbon-c-relay/issues/246)
+  using `stop` in a `match` tule does not stop metrics from being
+  processed afterwards
+* [Issue #206](https://github.com/grobian/carbon-c-relay/issues/206)
+  some metrics are randomly prefixed with garbage characters
+
+
+# 2.5 (2017-01-09)
+
+### Bugfixes
+
+* [Issue #239](https://github.com/grobian/carbon-c-relay/issues/239)
+  segfault when date format is incorrect
+* [Issue #242](https://github.com/grobian/carbon-c-relay/issues/242)
+  dispatcher/aggregations broken (relay seems too slow)
+
+
+# 2.4 (2017-01-03)
 
 ### New Features
 
@@ -8,6 +43,17 @@
 			 [Issue #121](https://github.com/grobian/carbon-c-relay/issues/121),
 			 [Pull #127](https://github.com/grobian/carbon-c-relay/issues/127),
 			 [Pull #87](https://github.com/grobian/carbon-c-relay/issues/87).
+
+### Bugfixes
+
+* **server** connection errors are no longer endlessly repeated
+* [Issue #240](https://github.com/grobian/carbon-c-relay/issues/240)
+  'include' directive doesn't care about rewrites.
+* [Issue #241](https://github.com/grobian/carbon-c-relay/issues/241)
+  XXX characters being prepended to metrics when sent via UDP
+* [Issue #204](https://github.com/grobian/carbon-c-relay/issues/204)
+  relay is sending data randomly while kill -HUP happens
+
 
 # 2.3 (2016-11-07)
 

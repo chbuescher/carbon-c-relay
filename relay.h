@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2016 Fabian Groffen
+ * Copyright 2013-2017 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 #ifndef HAVE_RELAY_H
 #define HAVE_RELAY_H 1
 
-#define VERSION "2.3"
+#define VERSION "2.6"
 
 #define METRIC_BUFSIZ 8192
 #define METRIC_MAXLEN 1024

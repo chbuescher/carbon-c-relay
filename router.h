@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2016 Fabian Groffen
+ * Copyright 2013-2017 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,7 @@ typedef struct _router router;
 #define RE_MAX_MATCHES     64
 
 router *router_readconfig(router *orig, const char *path, size_t queuesize, size_t batchsize, int maxstalls, unsigned short iotimeout, unsigned int sockbufsize);
-void router_optimise(router *r);
+void router_optimise(router *r, int threshold);
 char router_printdiffs(router *old, router *new, FILE *out);
 void router_transplant_queues(router *new, router *old);
 char router_start(router *r);

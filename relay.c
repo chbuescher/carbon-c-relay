@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2016 Fabian Groffen
+ * Copyright 2013-2017 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <netdb.h>
 #include <string.h>
 #include <signal.h>
 #include <time.h>
@@ -48,6 +49,7 @@ static int batchsize = 2500;
 static int queuesize = 25000;
 static int maxstalls = 4;
 static unsigned short iotimeout = 600;
+static int optimiserthreshold = 50;
 static int sockbufsize = 0;
 dispatcher **workers = NULL;
 char workercnt = 0;
@@ -158,7 +160,7 @@ do_reload(void)
 		logerr("failed to read configuration '%s', aborting reload\n", config);
 		return;
 	}
-	router_optimise(newrtr);
+	router_optimise(newrtr, optimiserthreshold);
 
 	/* compare the configs first, if there is no diff, then
 	 * just refrain from reloading anything */
@@ -325,6 +327,7 @@ do_usage(char *name, int exitcode)
 	printf("  -H  hostname: override hostname (used in statistics)\n");
 	printf("  -D  daemonise: run in a background\n");
 	printf("  -P  pidfile: write a pid to a specified pidfile\n");
+	printf("  -O  minimum number of rules before optimising the ruleset, default: %d\n", optimiserthreshold); 
 
 	exit(exitcode);
 }
@@ -351,7 +354,7 @@ main(int argc, char * const argv[])
 	if (gethostname(relay_hostname, sizeof(relay_hostname)) < 0)
 		snprintf(relay_hostname, sizeof(relay_hostname), "127.0.0.1");
 
-	while ((ch = getopt(argc, argv, ":hvdmstf:i:l:p:w:b:q:L:S:T:c:H:B:U:DP:")) != -1) {
+	while ((ch = getopt(argc, argv, ":hvdmstf:i:l:p:w:b:q:L:S:T:c:H:B:U:DP:O:")) != -1) {
 		switch (ch) {
 			case 'v':
 				do_version();
@@ -415,7 +418,7 @@ main(int argc, char * const argv[])
 			case 'L':
 				maxstalls = atoi(optarg);
 				if (maxstalls < 0 || maxstalls >= (1 << SERVER_STALL_BITS)) {
-					fprintf(stderr, "error: maxium stalls needs to be a number "
+					fprintf(stderr, "error: maximum stalls needs to be a number "
 							"between 0 and %d\n", (1 << SERVER_STALL_BITS) - 1);
 					do_usage(argv[0], 1);
 				}
@@ -497,6 +500,10 @@ main(int argc, char * const argv[])
 			case 'P':
 				pidfile = optarg;
 				break;
+			case 'O': {
+				int val = atoi(optarg);
+				optimiserthreshold = val < 0 ? -1 : val;
+			}	break;
 			case '?':
 			case ':':
 				do_usage(argv[0], 1);
@@ -688,7 +695,7 @@ main(int argc, char * const argv[])
 		logerr("failed to read configuration '%s'\n", config);
 		return 1;
 	}
-	router_optimise(rtr);
+	router_optimise(rtr, optimiserthreshold);
 
 	aggrs = router_getaggregators(rtr);
 	numaggregators = aggregator_numaggregators(aggrs);
@@ -791,7 +798,7 @@ main(int argc, char * const argv[])
 	/* server used for delivering metrics produced inside the relay,
 	 * that is, the collector (statistics) */
 	if ((internal_submission = server_new(
-					"internal", listenport, CON_PIPE, NULL, 3000,
+					"internal", listenport, CON_PIPE, NULL, NULL, 3000,
 					batchsize, maxstalls, iotimeout, sockbufsize)) == NULL)
 	{
 		logerr("failed to create internal submission queue, shutting down\n");

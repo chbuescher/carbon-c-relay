@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2016 Fabian Groffen
+ * Copyright 2013-2017 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -179,7 +179,6 @@ aggregator_putmetric(
 	double val;
 	long long int epoch;
 	long long int itime;
-	int slot;
 	char newmetric[METRIC_BUFSIZ];
 	char *newfirstspace = NULL;
 	size_t len;
@@ -196,7 +195,7 @@ aggregator_putmetric(
 	if (__sync_bool_compare_and_swap(&keep_running, 0, 0))
 		return;
 
-	/* get value */
+	/* get timestamp */
 	if ((v = strchr(firstspace + 1, ' ')) == NULL) {
 		/* metric includes \n */
 		if (mode & MODE_DEBUG)
@@ -234,14 +233,12 @@ aggregator_putmetric(
 			((omhash >> AGGR_HT_POW_SIZE) ^ omhash) &
 			(((unsigned int)1 << AGGR_HT_POW_SIZE) - 1);
 
-#define find_invocation(o) \
-		invocation = compute->invocations_ht[omhtbucket]; \
-		for (; invocation != NULL; invocation = invocation->next) \
-			if (invocation->hash == omhash && \
-					strcmp(o, invocation->metric) == 0)  /* match */ \
-				break;
 		pthread_rwlock_wrlock(&compute->invlock);
-		find_invocation(ometric);
+		invocation = compute->invocations_ht[omhtbucket];
+		for (; invocation != NULL; invocation = invocation->next)
+			if (invocation->hash == omhash &&
+					strcmp(ometric, invocation->metric) == 0)  /* match */
+				break;
 
 		if (invocation == NULL) {  /* no match, add */
 			long long int i;
@@ -309,8 +306,7 @@ aggregator_putmetric(
 			continue;
 		}
 
-		slot = itime / s->interval;
-		if (slot >= s->bucketcnt) {
+		if (itime >= (s->bucketcnt * s->interval)) {
 			if (mode & MODE_DEBUG)
 				logerr("aggregator: dropping metric too far in the "
 						"future (%lld > %lld): %s from %s", epoch,
@@ -321,7 +317,7 @@ aggregator_putmetric(
 			continue;
 		}
 
-		bucket = &invocation->buckets[slot];
+		bucket = &invocation->buckets[itime / s->interval];
 		if (bucket->cnt == 0) {
 			bucket->sum = val;
 			bucket->max = val;

@@ -1,4 +1,4 @@
-# Copyright 2013-2016 Fabian Groffen
+# Copyright 2013-2017 Fabian Groffen
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
-CFLAGS ?= -O2 -Wall -Wshadow
+CFLAGS ?= -O2 -g -Wall -Wshadow
 
 GIT_VERSION := $(shell git describe --abbrev=6 --dirty --always 2>/dev/null || date +%F)
 GVCFLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"
@@ -43,7 +42,7 @@ OBJS = \
 	aggregator.o
 
 relay: $(OBJS)
-	$(CC) -o $@ $(LDFLAGS) $^ $(LIBS)
+	$(CC) -o $@ $(CFLAGS) $(LDFLAGS) $^ $(LIBS)
 
 man:
 	sed -e '/travis-ci.org\/grobian\/carbon-c-relay.svg/d' carbon-c-relay.md | \

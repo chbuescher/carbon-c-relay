@@ -1,5 +1,5 @@
 /*
- * Copyright 2013-2016 Fabian Groffen
+ * Copyright 2013-2017 Fabian Groffen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,6 +43,8 @@ struct _server {
 	unsigned short port;
 	char *instance;
 	struct addrinfo *saddr;
+	struct addrinfo *hint;
+	char reresolve:1;
 	int fd;
 	queue *queue;
 	size_t bsize;
@@ -94,8 +96,6 @@ server_queuereader(void *d)
 	const char *p;
 
 	*metric = NULL;
-	__sync_and_and_fetch(&(self->metrics), 0);
-	__sync_and_and_fetch(&(self->ticks), 0);
 
 #define FAIL_WAIT_TIME   6  /* 6 * 250ms = 1.5s */
 #define DISCONNECT_WAIT_TIME   12  /* 12 * 250ms = 3s */
@@ -224,6 +224,9 @@ server_queuereader(void *d)
 			if (__sync_bool_compare_and_swap(&(self->keep_running), 0, 0))
 				break;
 			usleep((200 + (rand() % 100)) * 1000);  /* 200ms - 300ms */
+			/* avoid overflowing */
+			if (__sync_add_and_fetch(&(self->failure), 0) > FAIL_WAIT_TIME)
+				__sync_sub_and_fetch(&(self->failure), 1);
 		}
 
 		/* at this point we've got work to do, if we're instructed to
@@ -234,6 +237,20 @@ server_queuereader(void *d)
 
 		/* try to connect */
 		if (self->fd < 0) {
+			if (self->reresolve) {  /* can only be CON_UDP/CON_TCP */
+				struct addrinfo *saddr;
+				char sport[8];
+
+				/* re-lookup the address info, if it fails, stay with
+				 * whatever we have such that resolution errors incurred
+				 * after starting the relay won't make it fail */
+				snprintf(sport, sizeof(sport), "%u", self->port);
+				if (getaddrinfo(self->ip, sport, self->hint, &saddr) != 0) {
+					freeaddrinfo(self->saddr);
+					self->saddr = saddr;
+				}
+			}
+
 			if (self->ctype == CON_PIPE) {
 				int intconn[2];
 				if (pipe(intconn) < 0) {
@@ -243,26 +260,6 @@ server_queuereader(void *d)
 				}
 				dispatch_addlistener(intconn[0], 1);
 				self->fd = intconn[1];
-			} else if (self->ctype == CON_UDP) {
-				if ((self->fd = socket(self->saddr->ai_family,
-								self->saddr->ai_socktype,
-								self->saddr->ai_protocol)) < 0)
-				{
-					if (__sync_fetch_and_add(&(self->failure), 1) == 0)
-						logerr("failed to create udp socket: %s\n",
-								strerror(errno));
-					continue;
-				}
-				if (connect(self->fd,
-						self->saddr->ai_addr, self->saddr->ai_addrlen) < 0)
-				{
-					if (__sync_fetch_and_add(&(self->failure), 1) == 0)
-						logerr("failed to connect udp socket: %s\n",
-								strerror(errno));
-					close(self->fd);
-					self->fd = -1;
-					continue;
-				}
 			} else if (self->ctype == CON_FILE) {
 				if ((self->fd = open(self->ip,
 								O_WRONLY | O_APPEND | O_CREAT,
@@ -273,15 +270,45 @@ server_queuereader(void *d)
 								self->ip, strerror(errno));
 					continue;
 				}
-			} else {
+			} else if (self->ctype == CON_UDP) {
+				struct addrinfo *walk;
+
+				for (walk = self->saddr; walk != NULL; walk = walk->ai_next) {
+					if ((self->fd = socket(walk->ai_family,
+									walk->ai_socktype,
+									walk->ai_protocol)) < 0)
+					{
+						if (walk->ai_next == NULL &&
+								__sync_fetch_and_add(&(self->failure), 1) == 0)
+						logerr("failed to create udp socket: %s\n",
+								strerror(errno));
+					continue;
+				}
+					if (connect(self->fd, walk->ai_addr, walk->ai_addrlen) < 0)
+				{
+						if (walk->ai_next == NULL &&
+								__sync_fetch_and_add(&(self->failure), 1) == 0)
+						logerr("failed to connect udp socket: %s\n",
+								strerror(errno));
+					close(self->fd);
+					self->fd = -1;
+					continue;
+				}
+				}
+				if (self->fd < 0)
+					continue;
+			} else {  /* CON_TCP */
 				int ret;
 				int args;
+				struct addrinfo *walk;
 
-				if ((self->fd = socket(self->saddr->ai_family,
-								self->saddr->ai_socktype,
-								self->saddr->ai_protocol)) < 0)
+				for (walk = self->saddr; walk != NULL; walk = walk->ai_next) {
+					if ((self->fd = socket(walk->ai_family,
+									walk->ai_socktype,
+									walk->ai_protocol)) < 0)
 				{
-					if (__sync_fetch_and_add(&(self->failure), 1) == 0)
+						if (walk->ai_next == NULL &&
+								__sync_fetch_and_add(&(self->failure), 1) == 0)
 						logerr("failed to create socket: %s\n",
 								strerror(errno));
 					continue;
@@ -297,8 +324,7 @@ server_queuereader(void *d)
 					self->fd = -1;
 					continue;
 				}
-				ret = connect(self->fd,
-						self->saddr->ai_addr, self->saddr->ai_addrlen);
+					ret = connect(self->fd, walk->ai_addr, walk->ai_addrlen);
 
 				if (ret < 0 && errno == EINPROGRESS) {
 					/* wait for connection to succeed if the OS thinks
@@ -309,7 +335,9 @@ server_queuereader(void *d)
 					ret = poll(ufds, 1, self->iotimeout + (rand() % 100));
 					if (ret == 0) {
 						/* time limit expired */
-						if (__sync_fetch_and_add(&(self->failure), 1) == 0)
+							if (walk->ai_next == NULL &&
+									__sync_fetch_and_add(
+										&(self->failure), 1) == 0)
 							logerr("failed to connect() to "
 									"%s:%u: Operation timed out\n",
 									self->ip, self->port);
@@ -318,7 +346,9 @@ server_queuereader(void *d)
 						continue;
 					} else if (ret < 0) {
 						/* some select error occurred */
-						if (__sync_fetch_and_add(&(self->failure), 1) == 0)
+							if (walk->ai_next &&
+									__sync_fetch_and_add(
+										&(self->failure), 1) == 0)
 							logerr("failed to poll() for %s:%u: %s\n",
 									self->ip, self->port, strerror(errno));
 						close(self->fd);
@@ -326,7 +356,9 @@ server_queuereader(void *d)
 						continue;
 					} else {
 						if (ufds[0].revents & POLLHUP) {
-							if (__sync_fetch_and_add(&(self->failure), 1) == 0)
+								if (walk->ai_next == NULL &&
+										__sync_fetch_and_add(
+											&(self->failure), 1) == 0)
 								logerr("failed to connect() for %s:%u: "
 										"Hangup\n", self->ip, self->port);
 							close(self->fd);
@@ -335,7 +367,9 @@ server_queuereader(void *d)
 						}
 					}
 				} else if (ret < 0) {
-					if (__sync_fetch_and_add(&(self->failure), 1) == 0) {
+						if (walk->ai_next == NULL &&
+								__sync_fetch_and_add(&(self->failure), 1) == 0)
+						{
 						logerr("failed to connect() to %s:%u: %s\n",
 								self->ip, self->port, strerror(errno));
 						dispatch_check_rlimit_and_warn();
@@ -353,6 +387,9 @@ server_queuereader(void *d)
 					self->fd = -1;
 					continue;
 				}
+				if (self->fd < 0)
+					continue;
+			}
 
 				/* disable Nagle's algorithm, issue #208 */
 				args = 1;
@@ -412,14 +449,19 @@ server_queuereader(void *d)
 			 * resuming to complete.  So, use a loop, but to avoid
 			 * getting endlessly stuck on this, only try a limited
 			 * number of times for a single metric. */
-			for (cnt = 0, p = *metric;
-					cnt < 10 &&
-						(slen = write(self->fd, p, len)) != len &&
-						slen >= 0;
-					cnt++)
-			{
+			for (cnt = 0, p = *metric; cnt < 10; cnt++) {
+				if ((slen = write(self->fd, p, len)) != len) {
+					if (slen >= 0) {
 				p += slen;
 				len -= slen;
+					} else if (errno != EINTR) {
+						break;
+					}
+					/* allow the remote to catch up */
+					usleep((50 + (rand() % 150)) * 1000);  /* 50ms - 200ms */
+				} else {
+					break;
+				}
 			}
 			if (slen != len) {
 				/* not fully sent (after tries), or failure
@@ -429,7 +471,7 @@ server_queuereader(void *d)
 						__sync_fetch_and_add(&(self->failure), 1) == 0)
 					logerr("failed to write() to %s:%u: %s\n",
 							self->ip, self->port,
-							(slen < 0 ? strerror(errno) : "uncomplete write"));
+							(slen < 0 ? strerror(errno) : "incomplete write"));
 				close(self->fd);
 				self->fd = -1;
 				/* put back stuff we couldn't process */
@@ -477,6 +519,7 @@ server_new(
 		unsigned short port,
 		serv_ctype ctype,
 		struct addrinfo *saddr,
+		struct addrinfo *hint,
 		size_t qsize,
 		size_t bsize,
 		int maxstalls,
@@ -510,8 +553,23 @@ server_new(
 	}
 	ret->fd = -1;
 	ret->saddr = saddr;
+	ret->reresolve = 0;
+	ret->hint = NULL;
+	if (hint != NULL) {
+		ret->reresolve = 1;
+		ret->hint = malloc(sizeof(*hint));
+		if (ret->hint == NULL) {
+			free(ret->batch);
+			free((char *)ret->ip);
+			free(ret);
+			return NULL;
+		}
+		memcpy(ret->hint, hint, sizeof(*hint));
+	}
 	ret->queue = queue_new(qsize);
 	if (ret->queue == NULL) {
+		if (ret->hint)
+			free(ret->hint);
 		free(ret->batch);
 		free((char *)ret->ip);
 		free(ret);
@@ -690,6 +748,8 @@ server_free(server *s) {
 		free(s->instance);
 	if (s->saddr != NULL)
 		freeaddrinfo(s->saddr);
+	if (s->hint)
+		free(s->hint);
 	free((char *)s->ip);
 	s->ip = NULL;
 	free(s);
@@ -710,6 +770,16 @@ server_swap_queue(server *l, server *r)
 	t = l->queue;
 	l->queue = r->queue;
 	r->queue = t;
+	
+	/* swap associated statistics as well */
+	l->metrics = r->metrics;
+	l->dropped = r->dropped;
+	l->stalls = r->stalls;
+	l->ticks = r->ticks;
+	l->prevmetrics = r->prevmetrics;
+	l->prevdropped = r->prevdropped;
+	l->prevstalls = r->prevstalls;
+	l->prevticks = r->prevticks;
 }
 
 /**
