@@ -258,7 +258,7 @@ server_queuereader(void *d)
 						logerr("failed to create pipe: %s\n", strerror(errno));
 					continue;
 				}
-				dispatch_addlistener(intconn[0], 1);
+				dispatch_addlistener_aggr(intconn[0]);
 				self->fd = intconn[1];
 			} else if (self->ctype == CON_FILE) {
 				if ((self->fd = open(self->ip,

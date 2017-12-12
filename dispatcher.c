@@ -59,24 +59,25 @@ enum chartype {
 	IS_OTHER
 };
 
+typedef struct _listener {
+	int sock;
+	char noexpire;
+	char isudp;
+	enum listentype state;
+	struct event ev_read;
+	dispatcher *self;
+	TAILQ_ENTRY(_listener) entries; /* pointers to the next and previous entries in the tail queue */
+} listener;
+
 typedef struct _connection {
 	int sock;
 	char srcaddr[24];  /* string representation of source address */
 	char buf[METRIC_BUFSIZ];
 	int buflen;
-	char noexpire:1;
-	dispatcher *self;
+	listener *list;
 	struct event ev_read;
 	int metric_sent;
 } connection;
-
-typedef struct _listener {
-	int sock;
-	char noclose;
-	enum listentype state;
-	struct event ev_read;
-	TAILQ_ENTRY(_listener) entries; /* pointers to the next and previous entries in the tail queue */
-} listener;
 
 typedef struct _metric_block {
 	char srcaddr[24];  /* string representation of source address */
@@ -169,7 +170,7 @@ void dispatch_destroylisteners(void) {
  * Listener sockets are those which need to be accept()-ed on.
  */
 int
-dispatch_addlistener(int sock, char noclose)
+dispatch_addlistener(int sock, char noexpire, char isudp)
 {
 	listener *list;
 
@@ -199,8 +200,10 @@ dispatch_addlistener(int sock, char noclose)
 	if (list == NULL)
 		return -1;
 	list->sock = sock;
-	list->noclose = noclose;
+	list->noexpire = noexpire;
+	list->isudp = isudp;
 	list->state = PLAN_ACTIVE;
+	list->self = NULL;
 
 	TAILQ_INSERT_TAIL(&register_listener_head, list, entries);
 	pthread_mutex_unlock(&register_listener_lock);
@@ -237,7 +240,7 @@ dispatch_removelistener(int sock)
 int
 dispatch_addlistener_udp(int sock)
 {
-	dispatch_addlistener(sock, 1);
+	dispatch_addlistener(sock, 1, 1);
 
 	return 0;
 }
@@ -245,7 +248,13 @@ dispatch_addlistener_udp(int sock)
 int
 dispatch_addlistener_tcp(int sock)
 {
-	return dispatch_addlistener(sock, 0);
+	return dispatch_addlistener(sock, 0, 0);
+}
+
+int
+dispatch_addlistener_aggr(int sock)
+{
+	return dispatch_addlistener(sock, 1, 0);
 }
 
 
@@ -259,23 +268,23 @@ dispatch_process_dests(metric_block *metric, dispatcher *self, char *firstspace)
 	gettimeofday(&now, NULL);
 
 	/* perform routing of this metric */
-	tracef("dispatcher %d, connfd %d, metric %s",
-			self->id, conn->sock, conn->metric);
+	tracef("dispatcher %d, metric %s",
+			self->id, metric->metric);
 	__sync_add_and_fetch(&(self->blackholes),
 			router_route(self->rtr,
 			metric->dests, &metric->destlen, CONN_DESTS_SIZE,
 			metric->srcaddr,
 			metric->metric, firstspace));
-	tracef("dispatcher %d, connfd %d, destinations %zd\n",
-			self->id, conn->sock, conn->destlen);
+	tracef("dispatcher %d, destinations %zd\n",
+			self->id, metric->destlen);
 
 	if (metric->destlen > 0) {
 		force = 1;
 		for (i = 0; i < metric->destlen; i++) {
-			tracef("dispatcher %d, connfd %d, metric %s, queueing to %s:%d\n",
-					self->id, conn->sock, conn->dests[i].metric,
-					server_ip(conn->dests[i].dest),
-					server_port(conn->dests[i].dest));
+			tracef("dispatcher %d, metric %s, queueing to %s:%d\n",
+					self->id, metric->dests[i].metric,
+					server_ip(metric->dests[i].dest),
+					server_port(metric->dests[i].dest));
 			if (server_send(metric->dests[i].dest, metric->dests[i].metric, force) == 0)
 				break;
 		}
@@ -402,6 +411,7 @@ void
 dispatch_connread_cb(int fd, short ev, void *arg)
 {
 	connection *conn = (connection *)arg;
+	dispatcher *self = conn->list->self;
 	char *lastnl;
 	int len, buf_len;
 	metric_block *mblock;
@@ -410,7 +420,7 @@ dispatch_connread_cb(int fd, short ev, void *arg)
 
 	gettimeofday(&start, NULL);
 
-	if (__sync_bool_compare_and_swap(&(conn->self->keep_running), 1, 1)) {
+	if (__sync_bool_compare_and_swap(&(self->keep_running), 1, 1)) {
 		len = read(fd,
 					conn->buf + conn->buflen,
 					(sizeof(conn->buf) - 1) - conn->buflen);
@@ -458,14 +468,14 @@ dispatch_connread_cb(int fd, short ev, void *arg)
 		}
 
 		gettimeofday(&stop, NULL);
-		__sync_add_and_fetch(&(conn->self->ticks), timediff(start, stop));
+		__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
 
 		if (len == -1 && (errno == EINTR ||
 					errno == EAGAIN ||
 					errno == EWOULDBLOCK))
 		{
 			/* nothing available/no work done */
-			if (!conn->noexpire)
+			if (!conn->list->noexpire)
 			{
 				/* force close connection below */
 				len = 0;
@@ -474,24 +484,13 @@ dispatch_connread_cb(int fd, short ev, void *arg)
 			}
 		}
 
-		if (len == -1 || len == 0) {  /* error + EOF */
+		if (len == -1 || len == 0 || conn->list->isudp) {  /* error + EOF */
 			/* we also disconnect the client in this case if our reading
 			 * buffer is full, but we still need more (read returns 0 if the
 			 * size argument is 0) -> this is good, because we can't do much
 			 * with such client */
 
-#if 0
-			if (len == 0) {
-				/* Client disconnected */
-				printf("Client disconnected. Sent %d\n", conn->metric_sent);
-			}
-			else if (len < 0) {
-				/* Some other error occurred */
-				printf("Socket failure, disconnecting client: %s",
-					strerror(errno));
-			}
-#endif
-			if (conn->noexpire) {
+			if (conn->list->noexpire) {
 				/* reset buffer only (UDP) and move on */
 				conn->buflen = 0;
 			}
@@ -512,8 +511,11 @@ dispatch_connread_cb(int fd, short ev, void *arg)
  * ready to be accepted.
  */
 void
-dispatch_accept_cb(int fd, short ev, dispatcher *self, int is_udp)
+dispatch_accept_cb(int fd, short ev, void *arg)
 {
+	listener *list = (listener *)arg;
+	dispatcher *self = list->self;
+
 	int client_fd;
 	struct sockaddr_in6 client_addr;
 	socklen_t client_len = sizeof(client_addr);
@@ -521,7 +523,7 @@ dispatch_accept_cb(int fd, short ev, dispatcher *self, int is_udp)
 	struct timeval start, stop;
 
 	gettimeofday(&start, NULL);
-	if (is_udp) {
+	if (list->noexpire) {
 		client_fd = fd;
 	}
 	else {
@@ -556,8 +558,7 @@ dispatch_accept_cb(int fd, short ev, dispatcher *self, int is_udp)
 
 	client->sock = client_fd;
 	client->buflen = 0;
-	client->self = self;
-	client->noexpire = is_udp;
+	client->list = list;
 
 	/* figure out who's calling */
 	if (getpeername(client_fd, (struct sockaddr *)&client_addr, &client_len) == 0) {
@@ -595,17 +596,6 @@ dispatch_accept_cb(int fd, short ev, dispatcher *self, int is_udp)
 	__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
 }
 
-void
-dispatch_accept_cb_exp(int fd, short ev, void *arg) {
-	dispatcher *self = (dispatcher *)arg;
-	return dispatch_accept_cb(fd, ev, self, 0);
-}
-
-void
-dispatch_accept_cb_noexp(int fd, short ev, void *arg) {
-	dispatcher *self = (dispatcher *)arg;
-	return dispatch_accept_cb(fd, ev, self, 1);
-}
 
 static void dispatch_timer_cb (int fd, short flags, void *arg) {
 	dispatcher *self = (dispatcher *)arg;
@@ -626,8 +616,8 @@ static void dispatch_timer_cb (int fd, short flags, void *arg) {
 				list->state = CLOSED;
 			}
 			else if (PLAN_ACTIVE == list->state) {
-				event_set(&(list->ev_read), list->sock, EV_READ|EV_PERSIST,
-					(list->noclose) ? dispatch_accept_cb_noexp : dispatch_accept_cb_exp, self);
+				list->self = self;
+				event_set(&(list->ev_read), list->sock, EV_READ|EV_PERSIST, dispatch_accept_cb, list);
 				event_add(&(list->ev_read), NULL);
 				list->state = ACTIVE;
 			}

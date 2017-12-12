@@ -377,6 +377,10 @@ determine_if_regex(route *r, char *pat, int flags)
 			return -1;  /* allow use of regerror */
 		}
 		r->rule_extra = pcre_study(r->rule, PCRE_STUDY_JIT_COMPILE, &errptr);
+		if (r->rule_extra == NULL && errptr != NULL) {
+			logerr("error in studying regular expression '%s' for match: %s\n",
+					pat, errptr);
+		}
 		pcre_fullinfo(r->rule, r->rule_extra, PCRE_INFO_CAPTURECOUNT, &re_nsub);
 		r->strmatch = NULL;
 		r->pattern = strdup(pat);
@@ -1058,6 +1062,8 @@ router_readconfig(router *orig,
 					int err = determine_if_regex(r, pat,
 							PCRE_NO_AUTO_CAPTURE);
 					if (err != 0) {
+						logerr("invalid expression '%s' for match\n",
+								pat);
 						router_free(ret);
 						return NULL;
 					}
@@ -1294,7 +1300,7 @@ router_readconfig(router *orig,
 
 			if (matchcatchallfound) {
 				logerr("warning: match %s will never be matched "
-						"due to preceeding match * ... stop\n",
+						"due to preceding match * ... stop\n",
 						r->pattern == NULL ? "*" : r->pattern);
 			}
 			if (r->matchtype == MATCHALL && r->stop)
@@ -1356,6 +1362,8 @@ router_readconfig(router *orig,
 					m = r;
 				err = determine_if_regex(r, pat, 0);
 				if (err != 0) {
+					logerr("invalid expression '%s' "
+							"for aggregation\n", pat);
 					router_free(ret);
 					return NULL;
 				}
@@ -1798,6 +1806,7 @@ router_readconfig(router *orig,
 			r->next = NULL;
 			err = determine_if_regex(r, pat, REG_FORCE);
 			if (err != 0) {
+				logerr("invalid expression '%s' for rewrite\n", pat);
 				router_free(ret);
 				return NULL;
 			}
@@ -3215,6 +3224,11 @@ router_route(
 {
 	size_t curlen = 0;
 	char blackholed = 0;
+
+	if (strstr(firstspace, "nan") != NULL) {
+		*retcnt = 0;
+		return 1;
+	}
 
 	(void)router_route_intern(&blackholed, ret, &curlen, retsize, srcaddr,
 			metric, firstspace, rtr->routes);

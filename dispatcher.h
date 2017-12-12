@@ -25,9 +25,10 @@
 typedef struct _dispatcher dispatcher;
 
 void dispatch_check_rlimit_and_warn(void);
-int dispatch_addlistener(int sock, char noclose);
+int dispatch_addlistener(int sock, char noclose, char isudp);
 int dispatch_addlistener_tcp(int sock);
 int dispatch_addlistener_udp(int sock);
+int dispatch_addlistener_aggr(int sock);
 void dispatch_removelistener(int sock);
 int dispatch_addconnection(int sock);
 int dispatch_addconnection_aggr(int sock);
@@ -49,9 +50,7 @@ size_t dispatch_get_closed_connections(void);
 void dispatch_hold(dispatcher *d);
 void dispatch_schedulereload(dispatcher *d, router *r);
 char dispatch_reloadcomplete(dispatcher *d);
-void dispatch_accept_cb(int fd, short ev, dispatcher *self, int is_udp);
-void dispatch_accept_cb_exp(int fd, short ev, void *arg);
-void dispatch_accept_cb_noexp(int fd, short ev, void *arg);
+void dispatch_accept_cb(int fd, short ev, void *arg);
 void dispatch_initlisteners(void);
 void dispatch_destroylisteners(void);
 void dispatch_initctype(char *c);
