@@ -376,7 +376,7 @@ determine_if_regex(route *r, char *pat, int flags)
 					pat, errptr);
 			return -1;  /* allow use of regerror */
 		}
-		r->rule_extra = pcre_study(r->rule, 0, &errptr);
+		r->rule_extra = pcre_study(r->rule, PCRE_STUDY_JIT_COMPILE, &errptr);
 		pcre_fullinfo(r->rule, r->rule_extra, PCRE_INFO_CAPTURECOUNT, &re_nsub);
 		r->strmatch = NULL;
 		r->pattern = strdup(pat);
