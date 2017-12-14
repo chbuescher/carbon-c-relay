@@ -332,6 +332,42 @@ do_usage(char *name, int exitcode)
 	exit(exitcode);
 }
 
+/* copied from router_readconfig */
+server *
+tcp_server_new(char *ip, int listenport)
+{
+	struct addrinfo *saddrs = NULL;
+	struct addrinfo hint;
+	char sport[8];
+	int err;
+
+	/* try to see if this is a "numeric" IP address, in
+	 * which case we take the cannonical representation so
+	 * as to ensure (string) comparisons will match lateron */
+	memset(&hint, 0, sizeof(hint));
+
+	hint.ai_family = PF_UNSPEC;
+	hint.ai_socktype = SOCK_STREAM;
+	hint.ai_protocol = IPPROTO_TCP;
+	hint.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
+	snprintf(sport, sizeof(sport), "%u", listenport);
+
+	err = getaddrinfo(ip, sport, &hint, &saddrs);
+
+	/* now resolve this the normal way to check validity */
+	if (saddrs == NULL) {
+		hint.ai_flags = AI_NUMERICSERV;
+		if ((err = getaddrinfo(ip, sport, &hint, &saddrs)) != 0) {
+			return NULL;
+		}
+	}
+
+	return server_new(ip, listenport, CON_TCP,
+					saddrs, &hint, 3000,
+					batchsize, maxstalls, iotimeout, sockbufsize);
+}
+
+
 int
 main(int argc, char * const argv[])
 {
@@ -797,9 +833,7 @@ main(int argc, char * const argv[])
 
 	/* server used for delivering metrics produced inside the relay,
 	 * that is, the collector (statistics) */
-	if ((internal_submission = server_new(
-					"internal", listenport, CON_PIPE, NULL, NULL, 3000,
-					batchsize, maxstalls, iotimeout, sockbufsize)) == NULL)
+	if ((internal_submission = tcp_server_new("127.0.0.1", listenport)) == NULL)
 	{
 		logerr("failed to create internal submission queue, shutting down\n");
 		keep_running = 0;
@@ -813,6 +847,7 @@ main(int argc, char * const argv[])
 
 	if (numaggregators > 0) {
 		logout("starting aggregator\n");
+		aggregator_setserver(aggrs, internal_submission);
 		if (!aggregator_start(aggrs)) {
 			logerr("shutting down due to failure to start aggregator\n");
 			keep_running = 0;

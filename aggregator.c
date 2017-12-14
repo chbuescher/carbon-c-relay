@@ -50,22 +50,12 @@ aggregator_new(
 		enum _aggr_timestamp tswhen)
 {
 	aggregator *ret = malloc(sizeof(aggregator));
-	int intconn[2];
 
 	if (ret == NULL)
 		return ret;
 
 	assert(interval != 0);
 	assert(interval < expire);
-
-	if (pipe(intconn) < 0) {
-		logerr("failed to create pipe for aggregator: %s\n",
-				strerror(errno));
-		free(ret);
-		return NULL;
-	}
-	ret->disp_conn = dispatch_addlistener_aggr(intconn[0]);
-	ret->fd = intconn[1];
 
 	ret->interval = interval;
 	ret->expire = expire;
@@ -360,6 +350,7 @@ cmp_entry(const void *l, const void *r)
 	return *(const double *)l - *(const double *)r;
 }
 
+
 /**
  * Checks if the oldest bucket should be expired, if so, sends out
  * computed aggregate metrics and moves the bucket to the end of the
@@ -487,15 +478,9 @@ aggregator_expire(void *sub)
 									default:
 									   assert(0);  /* for compiler (len) */
 								}
-								ts = write(s->fd, metric, len);
-								if (ts < 0) {
-									logerr("aggregator: failed to write to "
-											"pipe (fd=%d): %s\n",
-											s->fd, strerror(errno));
-									__sync_add_and_fetch(&s->dropped, 1);
-								} else if (ts < len) {
-									logerr("aggregator: uncomplete write on "
-											"pipe (fd=%d)\n", s->fd);
+								ts = server_send(s->srvr, strdup(metric), 1);
+								if (ts == 0) {
+									logerr("aggregator: failed to send metric\n");
 									__sync_add_and_fetch(&s->dropped, 1);
 								} else {
 									__sync_add_and_fetch(&s->sent, 1);
@@ -598,6 +583,18 @@ aggregator_expire(void *sub)
 	}
 
 	return NULL;
+}
+
+/**
+ * Sets the server object in the aggregators.
+ */
+void
+aggregator_setserver(aggregator *aggrs, server *srv)
+{
+	aggregator *a;
+
+	for (a = aggrs; a != NULL; a = a->next)
+		a->srvr = srv;
 }
 
 /**

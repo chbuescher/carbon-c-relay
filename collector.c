@@ -190,7 +190,7 @@ collector_runner(void *s)
 		snprintf(m, sizem, "dispatch_sleepTime_us %zu %zu\n",
 				totsleeps, (size_t)now);
 		send(metric);
-		snprintf(m, sizem, "dispatch_totalMetricQueueLength %zu %zu\n",
+		snprintf(m, sizem, "totalMetricQueueLength %zu %zu\n",
 				totqueuelen, (size_t)now);
 		send(metric);
 

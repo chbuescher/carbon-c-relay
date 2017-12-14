@@ -28,11 +28,10 @@ typedef struct _aggregator {
 	unsigned short expire;    /* when incoming metrics are no longer valid */
 	enum _aggr_timestamp { TS_START, TS_MIDDLE, TS_END } tswhen;
 	unsigned char bucketcnt;
-	int disp_conn;
-	int fd;
 	size_t received;
 	size_t sent;
 	size_t dropped;
+	server *srvr;
 	struct _aggr_computes {
 		enum _aggr_compute_type { SUM, CNT, MAX, MIN, AVG,
 		                          MEDN, PCTL, VAR, SDEV } type;
@@ -68,6 +67,7 @@ void aggregator_set_stub(aggregator *s, const char *stubname);
 void aggregator_putmetric(aggregator *s, const char *metric, const char *firstspace, size_t nmatch, int *pmatch);
 int aggregator_start(aggregator *aggrs);
 void aggregator_stop(void);
+void aggregator_setserver(aggregator *aggrs, server *srv);
 size_t aggregator_numaggregators(aggregator *agrs);
 size_t aggregator_numcomputes(aggregator *aggrs);
 size_t aggregator_get_received(aggregator *aggrs);
