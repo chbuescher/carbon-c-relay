@@ -50,6 +50,7 @@ collector_runner(void *s)
 	size_t totstalls;
 	size_t totdropped;
 	size_t totsleeps;
+	size_t totqueuelen;
 	size_t ticks;
 	size_t metrics;
 	size_t blackholes;
@@ -57,6 +58,7 @@ collector_runner(void *s)
 	size_t stalls;
 	size_t dropped;
 	size_t sleeps;
+	size_t queuelen;
 	time_t now;
 	time_t nextcycle;
 	char destbuf[1024];  /* sort of POSIX_MAX_PATH */
@@ -76,6 +78,7 @@ collector_runner(void *s)
 	size_t (*d_metrics)(dispatcher *);
 	size_t (*d_blackholes)(dispatcher *);
 	size_t (*d_sleeps)(dispatcher *);
+	size_t (*d_queuelen)(dispatcher *);
 	size_t (*a_received)(aggregator *);
 	size_t (*a_sent)(aggregator *);
 	size_t (*a_dropped)(aggregator *);
@@ -90,6 +93,7 @@ collector_runner(void *s)
 		d_metrics = dispatch_get_metrics_sub;
 		d_blackholes = dispatch_get_blackholes_sub;
 		d_sleeps = dispatch_get_sleeps_sub;
+		d_queuelen = dispatch_get_queuelen;
 		a_received = aggregator_get_received_sub;
 		a_sent = aggregator_get_sent_sub;
 		a_dropped = aggregator_get_dropped_sub;
@@ -102,6 +106,7 @@ collector_runner(void *s)
 		d_metrics = dispatch_get_metrics;
 		d_blackholes = dispatch_get_blackholes;
 		d_sleeps = dispatch_get_sleeps;
+		d_queuelen = dispatch_get_queuelen;
 		a_received = aggregator_get_received;
 		a_sent = aggregator_get_sent;
 		a_dropped = aggregator_get_dropped;
@@ -152,6 +157,7 @@ collector_runner(void *s)
 		send(metric);
 
 		for (i = 1; dispatchers[i] != NULL; i++) {
+			totqueuelen += queuelen = d_queuelen(dispatchers[i]);
 			totsleeps += sleeps = d_sleeps(dispatchers[i]);
 			totticks += ticks = d_ticks(dispatchers[i]);
 			totmetrics += metrics = d_metrics(dispatchers[i]);
@@ -168,6 +174,9 @@ collector_runner(void *s)
 			snprintf(m, sizem, "dispatcher%d.sleepTime_us %zu %zu\n",
 					i, sleeps, (size_t)now);
 			send(metric);
+			snprintf(m, sizem, "dispatcher%d.metricQueueLength %zu %zu\n",
+					i, queuelen, (size_t)now);
+			send(metric);
 		}
 		snprintf(m, sizem, "metricsReceived %zu %zu\n",
 				totmetrics, (size_t)now);
@@ -180,6 +189,9 @@ collector_runner(void *s)
 		send(metric);
 		snprintf(m, sizem, "dispatch_sleepTime_us %zu %zu\n",
 				totsleeps, (size_t)now);
+		send(metric);
+		snprintf(m, sizem, "dispatch_totalMetricQueueLength %zu %zu\n",
+				totqueuelen, (size_t)now);
 		send(metric);
 
 #define send_server_metrics(ipbuf, ticks, metrics, queued, stalls, dropped) \
@@ -204,6 +216,7 @@ collector_runner(void *s)
 		totqueued = 0;
 		totstalls = 0;
 		totdropped = 0;
+		totqueuelen = 0;
 
 		/* exclude internal_submission metrics from the totals to avoid
 		 * artificial doubles due to internal routing details */

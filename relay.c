@@ -754,7 +754,7 @@ main(int argc, char * const argv[])
 		return 1;
 	}
 
-	if ((workers[0] = dispatch_new_listener(sockbufsize)) == NULL)
+	if ((workers[0] = dispatch_new_listener(sockbufsize, queuesize)) == NULL)
 		logerr("failed to add listener\n");
 	usleep(10000);
 

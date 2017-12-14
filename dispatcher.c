@@ -74,6 +74,7 @@ typedef struct _connection {
 	char srcaddr[24];  /* string representation of source address */
 	char buf[METRIC_BUFSIZ];
 	int buflen;
+	dispatcher *self;
 	listener *list;
 	struct event ev_read;
 	int metric_sent;
@@ -94,6 +95,7 @@ struct _dispatcher {
 	pthread_t tid;
 	enum conntype type;
 	char id;
+	size_t queuesize;
 	size_t metrics;
 	size_t blackholes;
 	size_t ticks;
@@ -177,23 +179,6 @@ dispatch_addlistener(int sock, char noexpire, char isudp)
 	(void) fcntl(sock, F_SETFL, O_NONBLOCK);
 
 	pthread_mutex_lock(&register_listener_lock);
-	/* search if socket is already in queue */
-	TAILQ_FOREACH(list, &register_listener_head, entries) {
-		if (list->sock == sock) {
-			if (PLAN_CLOSED == list->state) {
-				/* scheduled for unregister -> dont unregister */
-				list->state = ACTIVE;
-			}
-			else if (CLOSED == list->state) {
-				/* already unregistered -> renew */
-				list->state = PLAN_ACTIVE;
-			}
-			/* else already active or scheduled for register -> do nothing */
-
-			pthread_mutex_unlock(&register_listener_lock);
-			return 0;
-		}
-	}
 
 	/* insert new entry in queue */
 	list = malloc(sizeof(listener));
@@ -411,7 +396,7 @@ void
 dispatch_connread_cb(int fd, short ev, void *arg)
 {
 	connection *conn = (connection *)arg;
-	dispatcher *self = conn->list->self;
+	dispatcher *self = conn->self;
 	char *lastnl;
 	int len, buf_len;
 	metric_block *mblock;
@@ -450,7 +435,11 @@ dispatch_connread_cb(int fd, short ev, void *arg)
 
 						disp = workers[++idx % workercnt + 1];
 						pthread_mutex_lock(&disp->conn_queue_lock);
-						TAILQ_INSERT_TAIL(&disp->metric_block_head, mblock, entries);
+						/* check if metric block queue in selected worker isn't full */
+						if (disp->queuesize < self->queuesize) {
+							TAILQ_INSERT_TAIL(&disp->metric_block_head, mblock, entries);
+							disp->queuesize++;
+						}
 						pthread_cond_signal(&disp->conn_queue_cond);
 						pthread_mutex_unlock(&disp->conn_queue_lock);
 					}
@@ -559,6 +548,7 @@ dispatch_accept_cb(int fd, short ev, void *arg)
 	client->sock = client_fd;
 	client->buflen = 0;
 	client->list = list;
+	client->self = self;
 
 	/* figure out who's calling */
 	if (getpeername(client_fd, (struct sockaddr *)&client_addr, &client_len) == 0) {
@@ -613,7 +603,11 @@ static void dispatch_timer_cb (int fd, short flags, void *arg) {
 		TAILQ_FOREACH(list, &register_listener_head, entries) {
 			if (PLAN_CLOSED == list->state) {
 				event_del(&(list->ev_read));
-				list->state = CLOSED;
+				close(list->sock);
+
+				TAILQ_REMOVE(&register_listener_head, list, entries);
+				free(list);
+				break;
 			}
 			else if (PLAN_ACTIVE == list->state) {
 				list->self = self;
@@ -637,13 +631,13 @@ static void dispatch_timer_cb (int fd, short flags, void *arg) {
 		 * cleanup listener queue */
 		pthread_mutex_lock(&register_listener_lock);
 		while ((list = TAILQ_FIRST(&register_listener_head))) {
-			TAILQ_REMOVE(&register_listener_head, list, entries);
-			if (PLAN_CLOSED == list->state || ACTIVE == list->state) {
+			if (PLAN_ACTIVE != list->state) {
 				event_del(&(list->ev_read));
-				list->state = CLOSED;
 				if (ACTIVE == list->state)
 					close(list->sock);
 			}
+
+			TAILQ_REMOVE(&register_listener_head, list, entries);
 			free(list);
 		}
 		pthread_mutex_unlock(&register_listener_lock);
@@ -691,6 +685,7 @@ dispatch_runner(void *arg)
 		metric_block *mblock;
 
 		TAILQ_INIT(&self->metric_block_head);
+		self->queuesize = 0;
 		
 		while (__sync_bool_compare_and_swap(&(self->keep_running), 1, 1)) {
 			if (__sync_bool_compare_and_swap(&(self->route_refresh_pending), 1, 1)) {
@@ -712,6 +707,7 @@ dispatch_runner(void *arg)
 			else {
 				/* got data */
 				TAILQ_REMOVE(&self->metric_block_head, mblock, entries);
+				self->queuesize--;
 				pthread_mutex_unlock(&self->conn_queue_lock);
 				dispatch_parsebuf(self, mblock, start);
 				free(mblock);
@@ -732,7 +728,7 @@ dispatch_runner(void *arg)
  * Returns its handle.
  */
 static dispatcher *
-dispatch_new(char id, enum conntype type, router *r, char *allowed_chars)
+dispatch_new(char id, enum conntype type, router *r, char *allowed_chars, size_t queuesize)
 {
 	dispatcher *ret = malloc(sizeof(dispatcher));
 
@@ -746,6 +742,7 @@ dispatch_new(char id, enum conntype type, router *r, char *allowed_chars)
 	ret->route_refresh_pending = 0;
 	ret->hold = 0;
 	ret->allowed_chars = allowed_chars;
+	ret->queuesize = queuesize;
 
 	ret->metrics = 0;
 	ret->blackholes = 0;
@@ -771,11 +768,11 @@ static char globalid = 0;
  * (and putting them on the queue for handling the connections).
  */
 dispatcher *
-dispatch_new_listener(unsigned int nsockbufsize)
+dispatch_new_listener(unsigned int nsockbufsize, size_t queuesize)
 {
 	char id = globalid++;
 	sockbufsize = nsockbufsize;
-	return dispatch_new(id, LISTENER, NULL, NULL);
+	return dispatch_new(id, LISTENER, NULL, NULL, queuesize);
 }
 
 /**
@@ -788,7 +785,7 @@ dispatch_new_connection(router *r, char *allowed_chars)
 	char id = globalid++;
 	if (! ctype_isinit)
 		dispatch_initctype(allowed_chars);
-	return dispatch_new(id, CONNECTION, r, allowed_chars);
+	return dispatch_new(id, CONNECTION, r, allowed_chars, 0);
 }
 
 /**
@@ -943,6 +940,15 @@ dispatch_get_blackholes_sub(dispatcher *self)
 	size_t d = dispatch_get_blackholes(self) - self->prevblackholes;
 	self->prevblackholes += d;
 	return d;
+}
+
+/**
+ * Returns the length of the metric queue.
+ */
+inline size_t
+dispatch_get_queuelen(dispatcher *self)
+{
+	return __sync_add_and_fetch(&(self->queuesize), 0);
 }
 
 /**
