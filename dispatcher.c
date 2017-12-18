@@ -439,8 +439,12 @@ dispatch_connread_cb(int fd, short ev, void *arg)
 						if (disp->queuesize < self->queuesize) {
 							TAILQ_INSERT_TAIL(&disp->metric_block_head, mblock, entries);
 							disp->queuesize++;
+							pthread_cond_signal(&disp->conn_queue_cond);
 						}
-						pthread_cond_signal(&disp->conn_queue_cond);
+						else {
+							/* free metric block when queue is full */
+							free(mblock);
+						}
 						pthread_mutex_unlock(&disp->conn_queue_lock);
 					}
 				}
