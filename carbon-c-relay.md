@@ -8,6 +8,13 @@ carbon-c-relay(1) -- graphite relay, aggregator and rewriter
 
 ## DESCRIPTION
 
+This is a clone of grobians excellent **carbon-c-relay** program that
+is optimized for high network load and especially many open connections.
+This is achieved by using the libevent library for socket handling.
+Another enhancement is the usage of libpcre for pattern matching, which
+brings more powerful pattern matching and - thanks to the pcre JIT
+compiler - much more speed.
+
 **carbon-c-relay** accepts, cleanses, matches, rewrites, forwards and
 aggregates graphite metrics by listening for incoming connections and
 relaying the messages to other servers defined in its configuration.
