@@ -105,6 +105,7 @@ typedef struct _route {
 	pcre_extra * rule_extra;
 	size_t nmatch;    /* number of match groups */
 	char *strmatch;   /* string to search for if type not REGEX or MATCHALL */
+	size_t matchlen;  /* length of strmatch */
 	destinations *dests; /* where matches should go */
 	char stop:1;      /* whether to continue matching rules after this one */
 	enum {
@@ -366,6 +367,7 @@ determine_if_regex(route *r, char *pat, int flags)
 	if (r->matchtype != REGEX) {
 		*pb = '\0';
 		r->strmatch = strdup(patbuf);
+		r->matchlen = strlen(patbuf);
 		r->pattern = strdup(pat);
 	} else {
 		const char *errptr;
@@ -383,6 +385,7 @@ determine_if_regex(route *r, char *pat, int flags)
 		}
 		pcre_fullinfo(r->rule, r->rule_extra, PCRE_INFO_CAPTURECOUNT, &re_nsub);
 		r->strmatch = NULL;
+		r->matchlen = 0;
 		r->pattern = strdup(pat);
 		if ((re_nsub > 0) || flags & REG_FORCE)
 		{
@@ -1057,6 +1060,7 @@ router_readconfig(router *orig,
 				if (strcmp(pat, "*") == 0) {
 					r->pattern = NULL;
 					r->strmatch = NULL;
+					r->matchlen = 0;
 					r->matchtype = MATCHALL;
 				} else {
 					int err = determine_if_regex(r, pat,
@@ -1689,6 +1693,7 @@ router_readconfig(router *orig,
 				}
 				m->pattern = NULL;
 				m->strmatch = NULL;
+				m->matchlen = 0;
 				m->dests = dw;
 				m->stop = 1;
 				m->matchtype = MATCHALL;
@@ -1723,6 +1728,7 @@ router_readconfig(router *orig,
 				}
 				m->pattern = ra_strdup(ret, stubname);
 				m->strmatch = ra_strdup(ret, stubname);
+				m->matchlen = strlen(m->strmatch);
 				if (m->pattern == NULL || m->strmatch == NULL) {
 					logerr("malloc failed for catch stub aggr route pattern\n");
 					router_free(ret);
@@ -1948,6 +1954,7 @@ router_readconfig(router *orig,
 			}
 			m->pattern = NULL;
 			m->strmatch = NULL;
+			m->matchlen = 0;
 			m->dests = dw;
 			m->stop = 1;
 			m->matchtype = MATCHALL;
@@ -1982,6 +1989,7 @@ router_readconfig(router *orig,
 			}
 			m->pattern = ra_strdup(ret, stubname);
 			m->strmatch = ra_strdup(ret, stubname);
+			m->matchlen = strlen(m->strmatch);
 			if (m->pattern == NULL || m->strmatch == NULL) {
 				logerr("malloc failed for send statistics stub pattern\n");
 				router_free(ret);
@@ -2822,7 +2830,7 @@ router_metric_matches(
 			break;
 		case REGEX:
 			*firstspace = '\0';
-			ret = (pcre_exec(r->rule, r->rule_extra, metric, strlen (metric), 0, 0, ovector, RE_MAX_MATCHES*3) >= 0);
+			ret = (pcre_exec(r->rule, r->rule_extra, metric, firstspace - metric, 0, 0, ovector, RE_MAX_MATCHES*3) >= 0);
 			*firstspace = firstspc;
 			break;
 		case CONTAINS:
@@ -2831,12 +2839,12 @@ router_metric_matches(
 			*firstspace = firstspc;
 			break;
 		case STARTS_WITH:
-			ret = strncmp(metric, r->strmatch, strlen(r->strmatch)) == 0;
+			ret = strncmp(metric, r->strmatch, r->matchlen) == 0;
 			break;
 		case ENDS_WITH:
 			*firstspace = '\0';
 			ret = strcmp(
-					firstspace - strlen(r->strmatch),
+					firstspace - r->matchlen,
 					r->strmatch) == 0;
 			*firstspace = firstspc;
 			break;
