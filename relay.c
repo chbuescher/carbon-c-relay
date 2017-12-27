@@ -886,13 +886,13 @@ main(int argc, char * const argv[])
 	logout("closed listeners for port %u\n", listenport);
 	/* since workers will be freed, stop querying the structures */
 	collector_stop();
-	server_shutdown(internal_submission);
-	server_free(internal_submission);
 	logout("stopped collector\n");
 	if (numaggregators > 0) {
 		aggregator_stop();
 		logout("stopped aggregator\n");
 	}
+	server_shutdown(internal_submission);
+	server_free(internal_submission);
 	/* give a little time for whatever the collector/aggregator wrote,
 	 * to be delivered by the dispatchers */
 	usleep(500 * 1000);  /* 500ms */
