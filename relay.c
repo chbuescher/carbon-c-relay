@@ -53,6 +53,7 @@ static int optimiserthreshold = 50;
 static int sockbufsize = 0;
 dispatcher **workers = NULL;
 char workercnt = 0;
+int closeaftersec = 300;
 static router *rtr = NULL;
 static server *internal_submission = NULL;
 static char *relay_logfile = NULL;
@@ -328,6 +329,7 @@ do_usage(char *name, int exitcode)
 	printf("  -D  daemonise: run in a background\n");
 	printf("  -P  pidfile: write a pid to a specified pidfile\n");
 	printf("  -O  minimum number of rules before optimising the ruleset, default: %d\n", optimiserthreshold); 
+	printf("  -a  close inactive connections after <num> seconds, defaults to %d, 0 for disable\n", closeaftersec);
 
 	exit(exitcode);
 }
@@ -390,7 +392,7 @@ main(int argc, char * const argv[])
 	if (gethostname(relay_hostname, sizeof(relay_hostname)) < 0)
 		snprintf(relay_hostname, sizeof(relay_hostname), "127.0.0.1");
 
-	while ((ch = getopt(argc, argv, ":hvdmstf:i:l:p:w:b:q:L:S:T:c:H:B:U:DP:O:")) != -1) {
+	while ((ch = getopt(argc, argv, ":hvdmstf:i:l:p:w:a:b:q:L:S:T:c:H:B:U:DP:O:")) != -1) {
 		switch (ch) {
 			case 'v':
 				do_version();
@@ -429,6 +431,9 @@ main(int argc, char * const argv[])
 					fprintf(stderr, "error: port needs to be a number >0\n");
 					do_usage(argv[0], 1);
 				}
+				break;
+			case 'a':
+				closeaftersec = (char)atoi(optarg);
 				break;
 			case 'w':
 				workercnt = (char)atoi(optarg);
@@ -706,6 +711,7 @@ main(int argc, char * const argv[])
 		fprintf(relay_stdout, "    socket bufsize = %u\n", sockbufsize);
 	fprintf(relay_stdout, "    server connection IO timeout = %dms\n",
 			iotimeout);
+	fprintf(relay_stdout, "    inactive socket timeout = %ds\n", closeaftersec);
 	if (allowed_chars != NULL)
 		fprintf(relay_stdout, "    extra allowed characters = %s\n",
 				allowed_chars);

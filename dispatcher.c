@@ -31,7 +31,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/queue.h>
-#include <event.h>
+#include <event2/event.h>
+#include <event2/buffer.h>
+#include <event2/bufferevent.h>
 
 #include "relay.h"
 #include "receptor.h"
@@ -39,6 +41,8 @@
 #include "server.h"
 #include "collector.h"
 #include "dispatcher.h"
+
+#define MAX_LINE 8192
 
 enum conntype {
 	LISTENER,
@@ -64,7 +68,7 @@ typedef struct _listener {
 	char noexpire;
 	char isudp;
 	enum listentype state;
-	struct event ev_read;
+	struct event *ev_read;
 	dispatcher *self;
 	TAILQ_ENTRY(_listener) entries; /* pointers to the next and previous entries in the tail queue */
 } listener;
@@ -76,7 +80,7 @@ typedef struct _connection {
 	int buflen;
 	dispatcher *self;
 	listener *list;
-	struct event ev_read;
+	struct bufferevent *ev_read;
 	int metric_sent;
 } connection;
 
@@ -112,7 +116,7 @@ struct _dispatcher {
 	char *allowed_chars;
 	pthread_mutex_t conn_queue_lock;
 	pthread_cond_t conn_queue_cond;
-	struct event timer_ev;
+	struct event *timer_ev;
 	TAILQ_HEAD(, _metric_block) metric_block_head;
 };
 
@@ -130,6 +134,7 @@ static enum chartype ctype[256];
 
 extern dispatcher **workers;
 extern char workercnt;
+extern int closeaftersec;
 
 
 /**
@@ -388,12 +393,22 @@ dispatch_parsebuf(dispatcher *self, metric_block *mblock, struct timeval start) 
 	return metric_sent;
 }
 
+void
+dispatch_connerror_cb(struct bufferevent *bev, short error, void *arg)
+{
+	connection *conn = (connection *)arg;
+	if (error & BEV_EVENT_TIMEOUT)
+		logout("Got timeout for ip %s\n", conn->srcaddr);
+	free(conn);
+	bufferevent_free(bev);
+}
+
 /**
  * This function will be called by libevent when the client socket is
  * ready for reading.
  */
 void
-dispatch_connread_cb(int fd, short ev, void *arg)
+dispatch_connread_cb(struct bufferevent *bev, void *arg)
 {
 	connection *conn = (connection *)arg;
 	dispatcher *self = conn->self;
@@ -405,98 +420,63 @@ dispatch_connread_cb(int fd, short ev, void *arg)
 
 	gettimeofday(&start, NULL);
 
-	if (__sync_bool_compare_and_swap(&(self->keep_running), 1, 1)) {
-		len = read(fd,
-					conn->buf + conn->buflen,
-					(sizeof(conn->buf) - 1) - conn->buflen);
+	while (__sync_bool_compare_and_swap(&(self->keep_running), 1, 1)) {
+		/* try to read more data, if that succeeds, or we still have data
+		 * left in the buffer, try to process the buffer */
+		size_t free_bytes = (sizeof(conn->buf) - 1) - conn->buflen;
+		len = bufferevent_read(bev, conn->buf + conn->buflen, free_bytes);
+		if (len <= 0)
+			break;
 
-		if (len > 0) {
-			/* try to read more data, if that succeeds, or we still have data
-			 * left in the buffer, try to process the buffer */
-			conn->buflen += len;
-			tracef("dispatcher 0, connfd %d, read %d bytes from socket\n",
-					conn->sock, len);
+		conn->buflen += len;
+		tracef("dispatcher 0, connfd %d, read %d bytes from socket\n",
+				conn->sock, len);
 
-			// search last newline
-			lastnl = (char *) memrchr(conn->buf, '\n', conn->buflen);
+		// search last newline
+		lastnl = (char *) memrchr(conn->buf, '\n', conn->buflen);
 
-			if (lastnl != NULL) {
-				/* copy the buffer to new metric block
-				 * alloc struct + buffer */
-				buf_len = lastnl - conn->buf + 1;
-				if (buf_len > 1) {
-					mblock = malloc(sizeof(metric_block) + buf_len);
-					if (mblock) {
-						mblock->buf_len = buf_len;
-						mblock->buffer = &(mblock->_buf);
-						memcpy(mblock->buffer, conn->buf, mblock->buf_len);
-						mblock->buffer[mblock->buf_len] = 0;
-						strcpy(mblock->srcaddr, conn->srcaddr);
+		if (lastnl != NULL) {
+			/* copy the buffer to new metric block
+			 * alloc struct + buffer */
+			buf_len = lastnl - conn->buf + 1;
+			if (buf_len > 1) {
+				mblock = malloc(sizeof(metric_block) + buf_len);
+				if (mblock) {
+					mblock->buf_len = buf_len;
+					mblock->buffer = &(mblock->_buf);
+					memcpy(mblock->buffer, conn->buf, mblock->buf_len);
+					mblock->buffer[mblock->buf_len] = 0;
+					strcpy(mblock->srcaddr, conn->srcaddr);
 
-						disp = workers[++idx % workercnt + 1];
-						pthread_mutex_lock(&disp->conn_queue_lock);
-						/* check if metric block queue in selected worker isn't full */
-						if (disp->queuesize < self->queuesize) {
-							TAILQ_INSERT_TAIL(&disp->metric_block_head, mblock, entries);
-							disp->queuesize++;
-							pthread_cond_signal(&disp->conn_queue_cond);
-						}
-						else {
-							/* free metric block when queue is full */
-							free(mblock);
-						}
-						pthread_mutex_unlock(&disp->conn_queue_lock);
+					disp = workers[++idx % workercnt + 1];
+					pthread_mutex_lock(&disp->conn_queue_lock);
+					/* check if metric block queue in selected worker isn't full */
+					if (disp->queuesize < self->queuesize) {
+						TAILQ_INSERT_TAIL(&disp->metric_block_head, mblock, entries);
+						disp->queuesize++;
+						pthread_cond_signal(&disp->conn_queue_cond);
 					}
+					else {
+						/* free metric block when queue is full */
+						free(mblock);
+					}
+					pthread_mutex_unlock(&disp->conn_queue_lock);
 				}
-
-				/* move remaining stuff to the front */
-				conn->buflen -= buf_len;
-				memmove(conn->buf, lastnl + 1, conn->buflen);
 			}
-			/* prevent overflow of buffer with junk */
-			else if (conn->buflen > METRIC_MAXLEN) {
+
+			/* move remaining stuff to the front */
+			conn->buflen -= buf_len;
+			memmove(conn->buf, lastnl + 1, conn->buflen);
+		}
+		/* prevent overflow of buffer with junk */
+		else if (conn->buflen > METRIC_MAXLEN) {
 				conn->buflen -= METRIC_MAXLEN;
 				memmove(conn->buf, conn->buf + METRIC_MAXLEN + 1, conn->buflen);
-			}
-		}
-
-		gettimeofday(&stop, NULL);
-		__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
-
-		if (len == -1 && (errno == EINTR ||
-					errno == EAGAIN ||
-					errno == EWOULDBLOCK))
-		{
-			/* nothing available/no work done */
-			if (!conn->list->noexpire)
-			{
-				/* force close connection below */
-				len = 0;
-			} else {
-				return;
-			}
-		}
-
-		if (len == -1 || len == 0 || conn->list->isudp) {  /* error + EOF */
-			/* we also disconnect the client in this case if our reading
-			 * buffer is full, but we still need more (read returns 0 if the
-			 * size argument is 0) -> this is good, because we can't do much
-			 * with such client */
-
-			if (conn->list->noexpire) {
-				/* reset buffer only (UDP) and move on */
-				conn->buflen = 0;
-			}
-			else {
-				/* close the socket, remove
-				 * the event and free the client structure. */
-				close(conn->sock);
-				__sync_add_and_fetch(&closedconnections, 1);
-				event_del(&conn->ev_read);
-				free(conn);
-			}
 		}
 	}
+ 
+	gettimeofday(&stop, NULL);
+	__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
 }
 
 /**
@@ -523,7 +503,20 @@ dispatch_accept_cb(int fd, short ev, void *arg)
 		/* Accept the new connection. */
 		client_fd = accept(fd, (struct sockaddr *)&client_addr, &client_len);
 		if (client_fd == -1) {
-			logerr("accept failed");
+			int accErr = errno;
+			char ipAddr[INET6_ADDRSTRLEN];
+			switch (client_addr.sin6_family) {
+				case PF_INET:
+					inet_ntop(client_addr.sin6_family,
+							&((struct sockaddr_in *)&client_addr)->sin_addr,
+							ipAddr, sizeof(ipAddr));
+					break;
+				case PF_INET6:
+					inet_ntop(client_addr.sin6_family, &client_addr.sin6_addr,
+							ipAddr, sizeof(ipAddr));
+					break;
+			}
+			logerr("accept failed: Errno %d, IP: %s\n", accErr, ipAddr);
 			gettimeofday(&stop, NULL);
 			__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
 			return;
@@ -546,8 +539,10 @@ dispatch_accept_cb(int fd, short ev, void *arg)
 	// start work
 	
 	client = calloc(1, sizeof(connection));
-	if (client == NULL)
+	if (client == NULL) {
 		logerr("malloc failed");
+		return;
+	}
 
 	client->sock = client_fd;
 	client->buflen = 0;
@@ -576,15 +571,16 @@ dispatch_accept_cb(int fd, short ev, void *arg)
 	}
 
 	/* Setup the read event, libevent will call dispatch_connread_cb() whenever
-	 * the clients socket becomes read ready.  We also make the
-	 * read event persistent so we don't have to re-add after each
-	 * read. */
-	event_set(&client->ev_read, client_fd, EV_READ|EV_PERSIST, dispatch_connread_cb, 
-	    client);
-
-	/* Setting up the event does not activate, add the event so it
-	 * becomes active. */
-	event_add(&client->ev_read, NULL);
+	 * the clients socket becomes read ready. */
+	if ((client->ev_read = bufferevent_socket_new(ev_base, client_fd, BEV_OPT_CLOSE_ON_FREE))) {
+		bufferevent_setcb(client->ev_read, dispatch_connread_cb, NULL, dispatch_connerror_cb, (void*)client);
+		bufferevent_setwatermark(client->ev_read, EV_READ, 0, MAX_LINE);
+		if (closeaftersec >= 0) {
+			struct timeval close_after = { closeaftersec, 0 };
+			bufferevent_set_timeouts(client->ev_read, &close_after, NULL);
+		}
+		bufferevent_enable(client->ev_read, EV_READ);
+	}
 
 	gettimeofday(&stop, NULL);
 	__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
@@ -606,7 +602,7 @@ static void dispatch_timer_cb (int fd, short flags, void *arg) {
 		pthread_mutex_lock(&register_listener_lock);
 		TAILQ_FOREACH(list, &register_listener_head, entries) {
 			if (PLAN_CLOSED == list->state) {
-				event_del(&(list->ev_read));
+				event_del(list->ev_read);
 				close(list->sock);
 
 				TAILQ_REMOVE(&register_listener_head, list, entries);
@@ -615,8 +611,8 @@ static void dispatch_timer_cb (int fd, short flags, void *arg) {
 			}
 			else if (PLAN_ACTIVE == list->state) {
 				list->self = self;
-				event_set(&(list->ev_read), list->sock, EV_READ|EV_PERSIST, dispatch_accept_cb, list);
-				event_add(&(list->ev_read), NULL);
+				list->ev_read = event_new(ev_base, list->sock, EV_READ|EV_PERSIST, dispatch_accept_cb, (void*)list);
+				event_add(list->ev_read, NULL);
 				list->state = ACTIVE;
 			}
 		}
@@ -625,7 +621,7 @@ static void dispatch_timer_cb (int fd, short flags, void *arg) {
 		/* and reinsert timer event */
 		tv.tv_sec = 1;
 		tv.tv_usec = 0;
-		evtimer_add(&self->timer_ev, &tv);
+		evtimer_add(self->timer_ev, &tv);
 
 		gettimeofday(&stop, NULL);
 		__sync_add_and_fetch(&(self->ticks), timediff(start, stop));
@@ -636,7 +632,7 @@ static void dispatch_timer_cb (int fd, short flags, void *arg) {
 		pthread_mutex_lock(&register_listener_lock);
 		while ((list = TAILQ_FIRST(&register_listener_head))) {
 			if (PLAN_ACTIVE != list->state) {
-				event_del(&(list->ev_read));
+				event_del(list->ev_read);
 				if (ACTIVE == list->state)
 					close(list->sock);
 			}
@@ -668,16 +664,13 @@ dispatch_runner(void *arg)
 	pthread_cond_init(&self->conn_queue_cond, NULL);
 
 	if (self->type == LISTENER) {
-		struct timeval tv;
-
 		/* Initialize libevent. */
-		ev_base = event_init();
+		ev_base = event_base_new();
 
 		/* set up timer. */
-		tv.tv_sec = 1;
-		tv.tv_usec = 0;
-		evtimer_set(&self->timer_ev, dispatch_timer_cb, self);
-		evtimer_add(&self->timer_ev, &tv);
+		struct timeval interval = { 1, 0 };
+		self->timer_ev = event_new(ev_base, -1, EV_PERSIST, dispatch_timer_cb, (void*)self);
+		event_add(self->timer_ev, &interval);
 
 		/* Start the libevent event loop. */
 		event_base_dispatch(ev_base);
