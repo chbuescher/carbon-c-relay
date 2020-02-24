@@ -127,7 +127,7 @@ aggregator_add_compute(
 
 	ac->type = act;
 	ac->percentile = (unsigned char)pctl;
-	ac->metric = strdup(metric);
+	ac->metric = router_rewrite_pattern(metric);
 	memset(ac->invocations_ht, 0, sizeof(ac->invocations_ht));
 	ac->entries_needed = store;
 	pthread_rwlock_init(&ac->invlock, NULL);

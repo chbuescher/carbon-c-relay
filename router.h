@@ -45,6 +45,7 @@ char router_printdiffs(router *old, router *new, FILE *out);
 void router_transplant_queues(router *new, router *old);
 char router_start(router *r);
 size_t router_rewrite_metric(char (*newmetric)[METRIC_BUFSIZ], char **newfirstspace, const char *metric, const char *firstspace, const char *replacement, const size_t nmatch, int *pmatch);
+char *router_rewrite_pattern(const char *metric);
 void router_printconfig(router *r, FILE *f, char mode);
 char router_route(router *r, destination ret[], size_t *retcnt, size_t retsize, char *srcaddr, char *metric, char *firstspace);
 void router_test(router *r, char *metric_path);

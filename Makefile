@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-CFLAGS ?= -O2 -g -Wall -Wshadow
+CFLAGS ?= -O2 -g -fPIC -Wall -Wshadow
 
 GIT_VERSION := $(shell git describe --abbrev=6 --dirty --always 2>/dev/null || date +%F)
 GVCFLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"

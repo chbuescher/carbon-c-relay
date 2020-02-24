@@ -418,6 +418,38 @@ serverip(server *s)
 	return srvr;
 }
 
+/**
+ * replace \h in pattern by router hostname
+ */
+char *
+router_rewrite_pattern(const char *metric)
+{
+	char *buf, *s, *d;
+	char *pHost = strstr(metric, "\\h");
+	if (pHost != NULL) {
+		int pos = pHost - metric;
+		int lenMetric = strlen(metric);
+		int lenHost = strlen(relay_hostname);
+		if ((buf = (char *) malloc(lenMetric + lenHost - 1)) != NULL) {
+			strncpy(buf, metric, pos);
+			for (d = buf + pos, s = relay_hostname; *s; s++) {
+				if ((*s >= 'a' && *s <= 'z') ||
+					(*s >= 'A' && *s <= 'Z') ||
+					(*s >= '0' && *s <= '9') ||
+					strchr("-_:#", *s)) {
+						*d++ = *s;
+				}
+				else
+					*d++ = '_';
+			}
+			strcpy(buf + pos + lenHost, pHost + 2);
+		}
+	} else {
+		buf = strdup(metric);
+	}
+	
+	return buf;
+}
 
 /**
  * Populates the routing tables by reading the config file.
@@ -1751,6 +1783,7 @@ router_readconfig(router *orig,
 			}
 		} else if (strncmp(p, "rewrite", 7) == 0 && isspace(*(p + 7))) {
 			/* rewrite rule */
+			char *pt;
 			char *pat;
 			char *replacement;
 			int err;
@@ -1824,7 +1857,9 @@ router_readconfig(router *orig,
 			}
 			cl->type = REWRITE;
 			cl->name = NULL;
-			cl->members.replacement = ra_strdup(ret, replacement);
+			pt = router_rewrite_pattern(replacement);
+			cl->members.replacement = ra_strdup(ret, pt);
+			free(pt);
 			cl->next = NULL;
 			if (cl->members.replacement == NULL) {
 				logerr("malloc failed for rewrite cluster replacement\n");
@@ -2814,7 +2849,7 @@ router_free(router *rtr)
 	free(rtr);
 }
 
-inline static char
+static char
 router_metric_matches(
 		const route *r,
 		char *metric,
